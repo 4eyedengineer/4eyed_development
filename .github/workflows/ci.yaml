@@ -13,7 +13,7 @@ env:
 
 jobs:
   build:
-    runs-on: arc-runner-set
+    runs-on: arc-dangus
     permissions:
       contents: read
       packages: write
