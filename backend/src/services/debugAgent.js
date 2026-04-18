@@ -1,69 +1,54 @@
-import Anthropic from '@anthropic-ai/sdk';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import crypto from 'node:crypto';
 import { getRepoTree, getFileContent, parseGitHubUrl } from './github.js';
 import { getGeneratedFile } from './dockerfileGenerator.js';
 import { upsertConfigMap, deleteConfigMap, getPodLogs, getPodEvents, getPodHealth, getDeploymentSpec } from './kubernetes.js';
 import { triggerBuild, watchBuildJob, captureBuildLogs, deployService, getDecryptedEnvVars } from './buildPipeline.js';
 import { updateDeploymentStatus } from './deploymentService.js';
+import { runAgent } from './agentRunner.js';
+import { createFilesystemTools } from './tools/filesystem.js';
 import appEvents from './event-emitter.js';
 import logger from './logger.js';
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const DEBUG_MODEL = process.env.DEBUG_MODEL || 'claude-sonnet-4-5-20250929';
+const DEBUG_MODEL = process.env.DEBUG_MODEL || 'claude-haiku-4-5';
 const MAX_TOKENS = 8000;
+const MAX_AGENT_ITERATIONS = 30;
 
-let client = null;
-
-/**
- * Get or create Anthropic client singleton
- */
-function getClient() {
-  if (!client) {
-    if (!ANTHROPIC_API_KEY) {
-      throw new Error('ANTHROPIC_API_KEY environment variable is required');
-    }
-    client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-  }
-  return client;
-}
+// With ReAct, the agent has its own internal tool-call loop, so the outer
+// "rebuild and analyze again" loop can be much shorter than the legacy 10x.
+const DEFAULT_AGENT_MAX_ATTEMPTS = 3;
 
 /**
  * System prompt for debug agent - generalist for all failure phases
  */
 const DEBUG_SYSTEM_PROMPT = `You are an expert DevOps engineer debugging deployment failures.
 
-You will be given context about a failure including:
-- PHASE: build, startup, runtime, or health (tells you what kind of failure)
-- BUILD_LOGS: Container build output (if build phase)
-- POD_LOGS: Application container logs (if startup/runtime/health phase)
-- POD_EVENTS: Kubernetes events (scheduling, crashes, OOM, probe failures)
-- POD_HEALTH: Current pod status and restart counts
-- DEPLOYMENT_SPEC: Kubernetes deployment configuration
-- REPO_CONTEXT: Repository structure and key files
+You operate in agent mode with filesystem tools over a sandboxed copy of the repository plus diagnostic files. The sandbox contains:
+- The repo files (Dockerfile, package.json, source, etc.) — same paths as the repo
+- BUILD_LOGS.txt — most recent build output (if a build failure)
+- POD_LOGS.txt — application container logs (if a runtime/startup/health failure)
+- POD_EVENTS.txt — Kubernetes events
+- POD_HEALTH.txt — pod status and restart counts
+- DEPLOYMENT_SPEC.txt — current deployment manifest
+- TREE.txt — full path listing
+- PHASE.txt — one of: build, startup, runtime, health
 
-Analyze all provided context to understand the root cause. The PHASE tells you where in the lifecycle the failure occurred, but use ALL context to reason about the fix.
+Workflow:
+1. Read PHASE.txt and the relevant log files to understand the failure.
+2. Use list_dir / read_file / search to inspect any repo file you need.
+3. Modify files in place using write_file or str_replace. Edit the actual files in the sandbox — do NOT just describe a fix.
+4. When done, call submit_fix with the list of relative paths you modified plus a short explanation.
+5. If the issue cannot be fixed by editing files (source bugs, missing external deps, secrets, resource limits, infra config), call request_manual_fix with clear suggestedActions instead.
 
 SAFETY:
 - NEVER create or modify .env, secrets, credentials, or keys
-- Output COMPLETE file contents, not diffs
+- Write COMPLETE file contents when using write_file (no diffs / no placeholders / no "..." truncation)
+- Only modify files you understand the role of
+- Prefer the smallest fix that addresses the root cause
 
-OUTPUT FORMAT - respond with valid JSON only:
-{
-  "explanation": "Brief analysis of the error and what you're fixing",
-  "fileChanges": [
-    {"path": "Dockerfile", "content": "FROM node:20-alpine\\n..."}
-  ],
-  "needsManualFix": false,
-  "suggestedActions": ["Optional array of manual steps if needsManualFix is true"]
-}
-
-Set needsManualFix: true when:
-- Source code bugs that require human judgment
-- Missing external dependencies (APIs, databases)
-- Configuration issues outside the repository
-- Resource limits that need human decision
-- Authentication/secrets issues
-
-When needsManualFix is true, provide clear suggestedActions for the user.`;
+End your turn immediately after calling submit_fix or request_manual_fix.`;
 
 /**
  * Determine the failure phase based on deployment and pod state
@@ -189,44 +174,53 @@ export async function runDebugLoop(db, session, service, deployment, githubToken
   let buildLogs = deployment.build_logs || 'No build logs available';
   const attempts = [];
 
-  // Fetch repo context once (reused across attempts)
-  const repoContext = await fetchRepoContext(githubToken, service.repo_url, service.branch);
+  // Fetch the current full repo file set once (used to seed each sandbox).
+  // Per-attempt diagnostic context (logs, pod health) is refreshed inside the loop.
+  const repoSnapshot = await fetchRepoSnapshot(githubToken, service.repo_url, service.branch);
+
+  // Cap outer iterations: each one is a fresh sandbox + agent loop + Kaniko rebuild.
+  const outerMax = Math.min(session.max_attempts || DEFAULT_AGENT_MAX_ATTEMPTS, DEFAULT_AGENT_MAX_ATTEMPTS);
 
   try {
-    for (let attempt = 1; attempt <= session.max_attempts; attempt++) {
-      // Update session current attempt
+    for (let attempt = 1; attempt <= outerMax; attempt++) {
       await updateSessionAttempt(db, session.id, attempt);
 
-      // Emit progress event
       appEvents.emitDebugStatus(session.id, {
         attempt,
-        maxAttempts: session.max_attempts,
+        maxAttempts: outerMax,
         status: 'analyzing',
-        message: `Analyzing build failure (attempt ${attempt}/${session.max_attempts})...`
+        message: `Analyzing failure with agent (attempt ${attempt}/${outerMax})...`
       });
 
       logger.info({ sessionId: session.id, attempt }, 'Starting debug attempt');
 
-      // Call LLM to analyze and fix
-      const llmResult = await analyzeFailureWithLLM(buildLogs, repoContext, attempts);
+      // Run the ReAct agent against a fresh sandbox seeded with current repo state + latest logs.
+      const llmResult = await runDebugAgent({
+        sessionId: session.id,
+        attempt,
+        service,
+        deployment,
+        buildLogs,
+        repoSnapshot,
+        previousAttempts: attempts,
+      });
 
-      // Store attempt
       const attemptRecord = await createAttempt(db, session.id, attempt, llmResult);
       attempts.push({
         attemptNumber: attempt,
         explanation: llmResult.explanation,
-        fileChanges: llmResult.fileChanges
+        fileChanges: llmResult.fileChanges,
       });
 
-      // If LLM says manual fix is needed, trust it and stop
+      // Manual-fix path: agent called request_manual_fix or produced no file changes.
       if (llmResult.needsManualFix || !llmResult.fileChanges || llmResult.fileChanges.length === 0) {
-        logger.info({ sessionId: session.id, attempt }, 'LLM indicates manual fix required');
+        logger.info({ sessionId: session.id, attempt }, 'Agent indicates manual fix required');
 
         await updateSessionFailed(db, session.id, llmResult.explanation);
 
         appEvents.emitDebugStatus(session.id, {
           attempt,
-          maxAttempts: session.max_attempts,
+          maxAttempts: outerMax,
           status: 'needs_manual_fix',
           explanation: llmResult.explanation,
           suggestedActions: llmResult.suggestedActions || [],
@@ -236,39 +230,32 @@ export async function runDebugLoop(db, session, service, deployment, githubToken
         return { success: false, attempts: attempt, needsManualFix: true, explanation: llmResult.explanation, suggestedActions: llmResult.suggestedActions || [] };
       }
 
-      // Emit progress - applying changes
       appEvents.emitDebugStatus(session.id, {
         attempt,
-        maxAttempts: session.max_attempts,
+        maxAttempts: outerMax,
         status: 'building',
         explanation: llmResult.explanation,
         fileChanges: llmResult.fileChanges,
         message: 'Applying fixes and rebuilding...'
       });
 
-      // Apply file changes and rebuild
       const buildResult = await rebuildWithChanges(
         db, session.id, service, deployment, llmResult.fileChanges,
         githubToken, namespace, projectName
       );
 
-      // Update attempt with build result
       await updateAttemptResult(db, attemptRecord.id, buildResult.success, buildResult.logs);
 
       if (buildResult.success) {
-        // Success! Update session and deploy
         const finalChanges = llmResult.fileChanges;
-
         await updateSessionSuccess(db, session.id, finalChanges);
 
-        // Deploy the service
         const envVars = await getDecryptedEnvVars(db, service.id);
         await deployService(db, service, deployment, buildResult.imageTag, namespace, projectName, envVars);
 
-        // Emit success event
         appEvents.emitDebugStatus(session.id, {
           attempt,
-          maxAttempts: session.max_attempts,
+          maxAttempts: outerMax,
           status: 'succeeded',
           explanation: llmResult.explanation,
           fileChanges: finalChanges,
@@ -276,29 +263,32 @@ export async function runDebugLoop(db, session, service, deployment, githubToken
         });
 
         logger.info({ sessionId: session.id, attempt }, 'Debug session succeeded');
-
         return { success: true, attempts: attempt, fileChanges: finalChanges };
       }
 
-      // Build failed - update logs for next attempt
+      // Build failed — capture latest logs for the next agent attempt.
       buildLogs = buildResult.logs || buildLogs;
+      // Also update the in-memory snapshot's view of the modified files so the
+      // next attempt sees the previously attempted edits as the new baseline.
+      for (const fc of llmResult.fileChanges) {
+        repoSnapshot.files[fc.path] = fc.content;
+      }
 
       logger.info({
         sessionId: session.id,
         attempt,
-        remaining: session.max_attempts - attempt
+        remaining: outerMax - attempt
       }, 'Debug attempt failed, continuing...');
     }
 
-    // Max attempts reached - get final explanation
-    const finalExplanation = await generateFinalExplanation(buildLogs, repoContext, attempts);
+    const finalExplanation = await generateFinalExplanation(buildLogs, attempts);
 
     await updateSessionFailed(db, session.id, finalExplanation);
 
     // Emit failure event
     appEvents.emitDebugStatus(session.id, {
-      attempt: session.max_attempts,
-      maxAttempts: session.max_attempts,
+      attempt: outerMax,
+      maxAttempts: outerMax,
       status: 'failed',
       finalExplanation,
       message: 'Could not auto-fix after maximum attempts'
@@ -306,7 +296,7 @@ export async function runDebugLoop(db, session, service, deployment, githubToken
 
     logger.info({ sessionId: session.id }, 'Debug session failed after max attempts');
 
-    return { success: false, attempts: session.max_attempts, finalExplanation };
+    return { success: false, attempts: outerMax, finalExplanation };
 
   } catch (error) {
     logger.error({ sessionId: session.id, error: error.message }, 'Debug loop error');
@@ -323,104 +313,290 @@ export async function runDebugLoop(db, session, service, deployment, githubToken
 }
 
 /**
- * Analyze build failure and suggest fixes using LLM
+ * Run the ReAct debug agent for one outer attempt.
+ *
+ * Seeds a sandbox with current repo files + diagnostic logs, lets the
+ * model explore and edit via tools, then returns the modified-file set
+ * by reading them back from disk.
  */
-async function analyzeFailureWithLLM(buildLogs, repoContext, previousAttempts) {
-  const anthropic = getClient();
+async function runDebugAgent({ sessionId, attempt, service, deployment, buildLogs, repoSnapshot, previousAttempts }) {
+  const sandboxDir = await createSandboxDir(`debug-${sessionId}-${attempt}`);
 
-  const userMessage = buildDebugPrompt(buildLogs, repoContext, previousAttempts);
+  try {
+    // Seed sandbox: repo files + tree + diagnostic context.
+    await fs.writeFile(path.join(sandboxDir, 'TREE.txt'), repoSnapshot.fileTree, 'utf8');
+    for (const [relPath, content] of Object.entries(repoSnapshot.files)) {
+      const abs = path.join(sandboxDir, relPath);
+      await fs.mkdir(path.dirname(abs), { recursive: true });
+      await fs.writeFile(abs, content, 'utf8');
+    }
 
-  logger.debug('Calling LLM for debug analysis');
+    // Diagnostic context (logs, events, etc).
+    const phase = (deployment.status === 'failed' && buildLogs) ? 'build' : 'startup';
+    await fs.writeFile(path.join(sandboxDir, 'PHASE.txt'), phase, 'utf8');
+    await fs.writeFile(path.join(sandboxDir, 'BUILD_LOGS.txt'), String(buildLogs || 'No build logs available'), 'utf8');
 
-  const response = await anthropic.messages.create({
-    model: DEBUG_MODEL,
-    max_tokens: MAX_TOKENS,
-    messages: [{ role: 'user', content: userMessage }],
-    system: DEBUG_SYSTEM_PROMPT
-  });
+    // Snapshot file mtimes so we can detect what the agent modified, even if
+    // the agent forgets to declare them in modifiedFiles.
+    const baselineMtimes = await snapshotMtimes(sandboxDir);
 
-  const textContent = response.content.find(c => c.type === 'text');
-  if (!textContent) {
-    throw new Error('No text response from LLM');
+    // Per-attempt closure state for the submit/manual_fix tools.
+    let outcome = null; // {kind: 'fix'|'manual', ...}
+
+    const submitFix = {
+      name: 'submit_fix',
+      description: 'Submit the fix you applied via write_file / str_replace. Provide a short explanation and the relative paths of files you modified. Calling this ends the agent loop.',
+      input_schema: {
+        type: 'object',
+        required: ['explanation', 'modifiedFiles'],
+        properties: {
+          explanation: { type: 'string', description: 'Why this fix should resolve the failure' },
+          modifiedFiles: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Relative paths of files you modified',
+          },
+        },
+      },
+      execute: async (input) => {
+        outcome = { kind: 'fix', ...input };
+        return 'Fix submitted. End your turn now.';
+      },
+    };
+
+    const requestManual = {
+      name: 'request_manual_fix',
+      description: 'Call this when the failure cannot be fixed automatically by editing files (source bugs, missing external services, secrets, resource limits, infra configuration). Provide an explanation and concrete suggestedActions for the user. Calling this ends the agent loop.',
+      input_schema: {
+        type: 'object',
+        required: ['explanation', 'suggestedActions'],
+        properties: {
+          explanation: { type: 'string', description: 'Why this requires a human to fix' },
+          suggestedActions: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Concrete steps the user should take',
+          },
+        },
+      },
+      execute: async (input) => {
+        outcome = { kind: 'manual', ...input };
+        return 'Manual fix request recorded. End your turn now.';
+      },
+    };
+
+    const tools = [
+      ...createFilesystemTools(sandboxDir, { writable: true }),
+      submitFix,
+      requestManual,
+    ];
+
+    const initialMessage = buildDebugInitialMessage({
+      service,
+      deployment,
+      attempt,
+      previousAttempts,
+    });
+
+    const agentResult = await runAgent({
+      model: DEBUG_MODEL,
+      systemPrompt: DEBUG_SYSTEM_PROMPT,
+      initialUserMessage: initialMessage,
+      tools,
+      maxIterations: MAX_AGENT_ITERATIONS,
+      maxTokens: MAX_TOKENS,
+    });
+
+    const tokensUsed =
+      (agentResult.usage.input_tokens || 0) + (agentResult.usage.output_tokens || 0);
+
+    logger.info({
+      sessionId,
+      attempt,
+      iterations: agentResult.iterations,
+      stopReason: agentResult.stopReason,
+      cacheRead: agentResult.usage.cache_read_input_tokens,
+      tokensUsed,
+    }, 'Debug agent finished');
+
+    // Path 1: agent asked for manual fix.
+    if (outcome?.kind === 'manual') {
+      return {
+        explanation: outcome.explanation || 'Manual fix required',
+        fileChanges: [],
+        needsManualFix: true,
+        suggestedActions: outcome.suggestedActions || [],
+        tokensUsed,
+      };
+    }
+
+    // Path 2: agent submitted a fix. Read modified files back from sandbox.
+    // Use both the agent-declared list and a diff against baseline mtimes for safety.
+    const modifiedRelPaths = await detectModifiedFiles(sandboxDir, baselineMtimes, outcome?.modifiedFiles || []);
+    const fileChanges = [];
+    for (const rel of modifiedRelPaths) {
+      // Skip our injected diagnostic files — those aren't part of the repo.
+      if (isInjectedDiagnosticPath(rel)) continue;
+      try {
+        const content = await fs.readFile(path.join(sandboxDir, rel), 'utf8');
+        fileChanges.push({ path: rel, content });
+      } catch (err) {
+        logger.warn({ rel, err: err.message }, 'Failed to read modified file from sandbox');
+      }
+    }
+
+    if (!outcome) {
+      // Agent ran out of iterations / hit token budget without submitting.
+      return {
+        explanation: `Agent did not complete (stop_reason=${agentResult.stopReason}, iterations=${agentResult.iterations}). ${fileChanges.length} file(s) were modified but not formally submitted.`,
+        fileChanges,
+        needsManualFix: fileChanges.length === 0,
+        suggestedActions: fileChanges.length === 0 ? ['Inspect build logs and fix manually'] : [],
+        tokensUsed,
+      };
+    }
+
+    return {
+      explanation: outcome.explanation || 'No explanation provided',
+      fileChanges,
+      needsManualFix: false,
+      tokensUsed,
+    };
+  } finally {
+    await cleanupSandbox(sandboxDir);
   }
-
-  const result = parseJsonResponse(textContent.text);
-  const tokensUsed = (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0);
-
-  return {
-    explanation: result.explanation || 'No explanation provided',
-    fileChanges: result.fileChanges || [],
-    needsManualFix: result.needsManualFix || false,
-    tokensUsed
-  };
 }
 
 /**
- * Build the debug prompt for the LLM
+ * Build the user-message kickoff for the debug agent.
  */
-function buildDebugPrompt(buildLogs, repoContext, previousAttempts) {
-  let prompt = `## Build Logs\n\`\`\`\n${buildLogs}\n\`\`\`\n\n`;
-
-  prompt += `## Repository Structure\n\`\`\`\n${repoContext.fileTree}\n\`\`\`\n\n`;
-
-  if (repoContext.files && Object.keys(repoContext.files).length > 0) {
-    prompt += '## Current Files\n\n';
-    for (const [filename, content] of Object.entries(repoContext.files)) {
-      if (content) {
-        prompt += `### ${filename}\n\`\`\`\n${content}\n\`\`\`\n\n`;
-      }
-    }
-  }
+function buildDebugInitialMessage({ service, deployment, attempt, previousAttempts }) {
+  let msg = `Debug attempt ${attempt} for service "${service.name}" (deployment ${deployment.id}).\n\n`;
+  msg += `Repo: ${service.repo_url} (branch: ${service.branch})\n\n`;
+  msg += `Start by reading PHASE.txt and BUILD_LOGS.txt to understand the failure. Then explore the repo files (the sandbox already has them). Apply your fix using write_file or str_replace, then call submit_fix.\n\n`;
 
   if (previousAttempts.length > 0) {
-    prompt += '## Previous Attempts\n\n';
-    for (const attempt of previousAttempts) {
-      prompt += `### Attempt ${attempt.attemptNumber}\n`;
-      prompt += `**Explanation:** ${attempt.explanation}\n`;
-      if (attempt.fileChanges && attempt.fileChanges.length > 0) {
-        prompt += `**Files Modified:** ${attempt.fileChanges.map(f => f.path).join(', ')}\n`;
+    msg += `## Previous attempts in this session (did NOT fix the issue)\n`;
+    for (const a of previousAttempts) {
+      msg += `- Attempt ${a.attemptNumber}: ${a.explanation}`;
+      if (a.fileChanges && a.fileChanges.length > 0) {
+        msg += ` (modified: ${a.fileChanges.map(f => f.path).join(', ')})`;
       }
-      prompt += '\n';
+      msg += '\n';
     }
-    prompt += 'The above attempts did not fix the issue. Try a different approach.\n\n';
+    msg += '\nTry a different approach this time.\n';
   }
 
-  prompt += 'Analyze the build failure and provide fixes.';
-
-  return prompt;
+  return msg;
 }
 
 /**
- * Generate final explanation when max attempts reached
+ * Generate a final user-facing explanation when outer attempts are exhausted.
+ * Uses the agent runner with no tools so we still get prompt caching.
  */
-async function generateFinalExplanation(buildLogs, repoContext, attempts) {
-  const anthropic = getClient();
+async function generateFinalExplanation(buildLogs, attempts) {
+  const userMessage = `After ${attempts.length} attempts, we could not automatically fix this deployment failure.
 
-  const userMessage = `After ${attempts.length} attempts, we could not automatically fix this build failure.
-
-## Build Logs
+## Latest build logs
 \`\`\`
-${buildLogs}
+${String(buildLogs).slice(-4000)}
 \`\`\`
 
-## Previous Attempts
+## Attempts tried
 ${attempts.map(a => `- Attempt ${a.attemptNumber}: ${a.explanation}`).join('\n')}
 
 Please provide:
-1. A clear explanation of why the build cannot be automatically fixed
-2. Specific manual steps the user can take to resolve the issue
+1. A clear explanation of why the failure cannot be automatically fixed
+2. Specific manual steps the user can take
 
 Be concise and actionable.`;
 
-  const response = await anthropic.messages.create({
-    model: DEBUG_MODEL,
-    max_tokens: 2000,
-    messages: [{ role: 'user', content: userMessage }],
-    system: 'You are a helpful DevOps engineer explaining why a build cannot be automatically fixed and what the user should do.'
-  });
+  try {
+    const result = await runAgent({
+      model: DEBUG_MODEL,
+      systemPrompt: 'You are a helpful DevOps engineer explaining why a deployment cannot be automatically fixed and what the user should do. Respond as plain text.',
+      initialUserMessage: userMessage,
+      tools: [],
+      maxIterations: 2,
+      maxTokens: 2000,
+    });
+    const finalText = (result.finalMessage?.content || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('\n');
+    return finalText || 'Unable to generate explanation';
+  } catch (err) {
+    logger.warn({ err: err.message }, 'generateFinalExplanation failed');
+    return 'Unable to generate explanation';
+  }
+}
 
-  const textContent = response.content.find(c => c.type === 'text');
-  return textContent?.text || 'Unable to generate explanation';
+// ---------- sandbox helpers ----------
+
+async function createSandboxDir(prefix) {
+  const base = path.join(os.tmpdir(), 'dangus-agent');
+  await fs.mkdir(base, { recursive: true });
+  const dir = path.join(base, `${prefix}-${crypto.randomUUID()}`);
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+}
+
+async function cleanupSandbox(dir) {
+  try {
+    await fs.rm(dir, { recursive: true, force: true });
+  } catch (err) {
+    logger.warn({ dir, err: err.message }, 'Failed to clean up debug sandbox');
+  }
+}
+
+const INJECTED_DIAGNOSTIC_FILES = new Set([
+  'TREE.txt', 'PHASE.txt', 'BUILD_LOGS.txt',
+  'POD_LOGS.txt', 'POD_EVENTS.txt', 'POD_HEALTH.txt', 'DEPLOYMENT_SPEC.txt',
+]);
+
+function isInjectedDiagnosticPath(rel) {
+  return INJECTED_DIAGNOSTIC_FILES.has(rel);
+}
+
+/**
+ * Walk sandbox and capture mtimeMs for every file.
+ */
+async function snapshotMtimes(root) {
+  const out = new Map();
+  async function walk(dir) {
+    let entries;
+    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const ent of entries) {
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        await walk(full);
+      } else if (ent.isFile()) {
+        try {
+          const st = await fs.stat(full);
+          out.set(path.relative(root, full), st.mtimeMs);
+        } catch { /* ignore */ }
+      }
+    }
+  }
+  await walk(root);
+  return out;
+}
+
+/**
+ * Detect files that were created or modified vs the baseline snapshot.
+ * Merges in the agent-declared `declared` list (relative paths) for safety.
+ */
+async function detectModifiedFiles(root, baseline, declared) {
+  const current = await snapshotMtimes(root);
+  const set = new Set();
+  for (const [rel, mt] of current.entries()) {
+    const prior = baseline.get(rel);
+    if (prior === undefined || mt !== prior) set.add(rel);
+  }
+  for (const rel of declared) {
+    if (typeof rel === 'string' && rel.length > 0) set.add(rel);
+  }
+  return [...set];
 }
 
 /**
@@ -547,19 +723,20 @@ async function triggerDebugBuild(db, service, deployment, commitSha, githubToken
 }
 
 /**
- * Fetch repository context for LLM
+ * Fetch repository snapshot for the agent sandbox.
+ * Returns the same {fileTree, files} shape we used pre-refactor — the agent
+ * runner writes `files` to disk and exposes `fileTree` as TREE.txt so the
+ * model can browse paths it didn't get pre-loaded.
  */
-async function fetchRepoContext(githubToken, repoUrl, branch) {
+async function fetchRepoSnapshot(githubToken, repoUrl, branch) {
   const tree = await getRepoTree(githubToken, repoUrl, branch);
 
-  // Format file tree (limited to 200 entries)
   const fileTree = tree
     .map(f => f.path)
     .sort()
     .slice(0, 200)
     .join('\n');
 
-  // Fetch key files
   const files = await fetchKeyFiles(githubToken, repoUrl, branch, tree);
 
   return { fileTree, files };
@@ -621,29 +798,6 @@ async function storeGeneratedFile(db, serviceId, fileType, content) {
       llm_model = EXCLUDED.llm_model,
       updated_at = NOW()
   `, [serviceId, fileType, content, DEBUG_MODEL, '{}', 0]);
-}
-
-/**
- * Parse JSON response from LLM
- */
-function parseJsonResponse(text) {
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    // Try markdown code block
-    const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[1].trim());
-    }
-
-    // Try to find JSON object
-    const objectMatch = text.match(/\{[\s\S]*\}/);
-    if (objectMatch) {
-      return JSON.parse(objectMatch[0]);
-    }
-
-    throw new Error(`Failed to parse LLM response: ${text.substring(0, 200)}`);
-  }
 }
 
 // Database helper functions

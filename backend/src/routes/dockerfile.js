@@ -1,6 +1,6 @@
 import { decrypt } from '../services/encryption.js';
 import { generateForRepo, getGeneratedFile } from '../services/dockerfileGenerator.js';
-import { isLLMAvailable } from '../services/llmClient.js';
+import { isLLMAvailable, DEFAULT_MODEL } from '../services/llmClient.js';
 import logger from '../services/logger.js';
 
 /**
@@ -27,7 +27,7 @@ export default async function dockerfileRoutes(fastify, options) {
   fastify.get('/dockerfile/status', async (request, reply) => {
     return {
       available: isLLMAvailable(),
-      model: 'claude-3-5-haiku-20241022'
+      model: DEFAULT_MODEL
     };
   });
 

@@ -3,6 +3,7 @@ import { deleteDeployment, deleteService, deleteIngress, deletePVC, getDeploymen
 import { getLatestCommit } from '../services/github.js';
 import { decrypt, encrypt } from '../services/encryption.js';
 import { runBuildPipeline } from '../services/buildPipeline.js';
+import { DEFAULT_MODEL } from '../services/llmClient.js';
 import {
   validateServiceName,
   validateEnvVarKey,
@@ -364,7 +365,7 @@ export default async function serviceRoutes(fastify, options) {
             [
               service.id,
               svc.generated_dockerfile.dockerfile,
-              'claude-3-5-haiku-20241022',
+              DEFAULT_MODEL,
               JSON.stringify(detectedFramework)
             ]
           );
@@ -377,7 +378,7 @@ export default async function serviceRoutes(fastify, options) {
               [
                 service.id,
                 svc.generated_dockerfile.dockerignore,
-                'claude-3-5-haiku-20241022',
+                DEFAULT_MODEL,
                 JSON.stringify(detectedFramework)
               ]
             );
