@@ -4,3 +4,7 @@ export { useDebugSession } from './useDebugSession';
 export { useRealtimeMetrics } from './useRealtimeMetrics';
 export { useRealtimeHealth } from './useRealtimeHealth';
 export { useModal } from './useModal';
+export { useServiceData } from './useServiceData';
+export { useServiceActions } from './useServiceActions';
+export { useProjectData } from './useProjectData';
+export { useProjectActions } from './useProjectActions';

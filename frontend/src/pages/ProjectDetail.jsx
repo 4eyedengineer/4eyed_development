@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { TerminalCard, TerminalDivider, TerminalSection, TerminalModal } from '../components/TerminalCard'
 import { StatusIndicator, ProgressGauge } from '../components/StatusIndicator'
 import { ErrorDisplay } from '../components/ErrorDisplay'
@@ -7,10 +7,10 @@ import TerminalSpinner from '../components/TerminalSpinner'
 import TerminalTabs from '../components/TerminalTabs'
 import TerminalInput from '../components/TerminalInput'
 import { useToast } from '../components/Toast'
-import { fetchProject, startProject, stopProject, updateProject, deleteProject } from '../api/projects'
-import { deleteService, fetchServiceLogs } from '../api/services'
-import { ApiError } from '../api/utils'
+import { fetchServiceLogs } from '../api/services'
 import { useWebSocket } from '../hooks/useWebSocket'
+import { useProjectData } from '../hooks/useProjectData'
+import { useProjectActions } from '../hooks/useProjectActions'
 import { useCopyToClipboard, formatDate, getStatusText, getStatusIndicator } from '../utils'
 
 const PROJECT_TABS = [
@@ -21,83 +21,49 @@ const PROJECT_TABS = [
 ]
 
 export function ProjectDetail({ projectId, activeTab = 'overview', onTabChange, onServiceClick, onNewService, onBack }) {
-  const [project, setProject] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
+  // Data + realtime status via hook
+  const { project, serviceStatuses, isLoading, error, refetch } = useProjectData(projectId)
+
+  // Actions + collapsed pending flags via hook
+  const { actions, pending } = useProjectActions(projectId, {
+    refetch,
+    onDeleted: onBack
+  })
+
+  // UI-only state
   const [servicesCollapsed, setServicesCollapsed] = useState(false)
   const [discoveryCollapsed, setDiscoveryCollapsed] = useState(false)
   const [showDeleteModal, setShowDeleteModal] = useState(null)
-  const [deleting, setDeleting] = useState(false)
   const [projectState, setProjectState] = useState('running')
-  const [changingState, setChangingState] = useState(false)
-  const [serviceStatuses, setServiceStatuses] = useState({})
 
-  // Settings tab state
+  // Settings tab UI state
   const [editingName, setEditingName] = useState(false)
   const [newProjectName, setNewProjectName] = useState('')
-  const [savingName, setSavingName] = useState(false)
   const [showDeleteProjectModal, setShowDeleteProjectModal] = useState(false)
-  const [deletingProject, setDeletingProject] = useState(false)
   const [deleteConfirmText, setDeleteConfirmText] = useState('')
 
-  // Logs tab state
+  // Logs tab UI state
   const [selectedServiceForLogs, setSelectedServiceForLogs] = useState('all')
   const [logs, setLogs] = useState([])
   const [logsLoading, setLogsLoading] = useState(false)
 
   const toast = useToast()
   const { copy, copied } = useCopyToClipboard()
-  const { connectionState, subscribe, isConnected } = useWebSocket()
-  const unsubscribesRef = useRef([])
+  const { isConnected } = useWebSocket()
 
-  // Initial load
+  // Seed the inline-edit name field when the project loads
   useEffect(() => {
-    if (projectId) {
-      loadProject()
+    if (project?.name) {
+      setNewProjectName(project.name)
     }
-  }, [projectId])
+  }, [project?.name])
 
-  // Subscribe to deployment status updates for all services
-  useEffect(() => {
-    if (!project?.services?.length) return
-
-    unsubscribesRef.current.forEach(unsub => unsub())
-    unsubscribesRef.current = []
-
-    for (const service of project.services) {
-      if (service.latest_deployment_id) {
-        const channel = `deployment:${service.latest_deployment_id}:status`
-
-        const unsubscribe = subscribe(channel, (event) => {
-          const { payload } = event
-
-          setServiceStatuses(prev => ({
-            ...prev,
-            [service.id]: payload.status
-          }))
-
-          if (payload.status === 'live') {
-            toast.success(`Service "${service.name}" is now live`)
-          } else if (payload.status === 'failed') {
-            toast.error(`Deployment failed for "${service.name}"`)
-          }
-        })
-
-        unsubscribesRef.current.push(unsubscribe)
-      }
-    }
-
-    return () => {
-      unsubscribesRef.current.forEach(unsub => unsub())
-      unsubscribesRef.current = []
-    }
-  }, [project?.services, subscribe, toast])
-
-  // Load logs when logs tab is active
+  // Load logs when the logs tab is active (or service filter changes)
   useEffect(() => {
     if (activeTab === 'logs' && project?.services?.length > 0) {
       loadLogs()
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, selectedServiceForLogs, project?.services])
 
   const getRealtimeStatus = useCallback((service) => {
@@ -111,22 +77,6 @@ export function ProjectDetail({ projectId, activeTab = 'overview', onTabChange, 
       return ['pending', 'building', 'deploying'].includes(status)
     })
   }, [project?.services, getRealtimeStatus])
-
-  const loadProject = async () => {
-    setLoading(true)
-    setError(null)
-    setProject(null)
-    try {
-      const data = await fetchProject(projectId)
-      setProject(data)
-      setNewProjectName(data.name)
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Failed to load project')
-      toast.error('Failed to load project')
-    } finally {
-      setLoading(false)
-    }
-  }
 
   const loadLogs = async () => {
     if (!project?.services?.length) return
@@ -165,42 +115,22 @@ export function ProjectDetail({ projectId, activeTab = 'overview', onTabChange, 
   }
 
   const handleDeleteService = async (service) => {
-    setDeleting(true)
-    try {
-      await deleteService(service.id)
-      await loadProject()
+    const ok = await actions.deleteService(service)
+    if (ok) {
       setShowDeleteModal(null)
-      toast.success(`Service "${service.name}" deleted successfully`)
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : 'Failed to delete service'
-      toast.error(message)
-    } finally {
-      setDeleting(false)
     }
   }
 
   const handleToggleProjectState = async () => {
-    if (changingState || !project?.services?.length) return
+    if (pending.changingState || !project?.services?.length) return
 
     const newState = projectState === 'running' ? 'stopped' : 'running'
-    setChangingState(true)
-
-    try {
-      if (newState === 'stopped') {
-        await stopProject(projectId)
-        toast.success('All services stopped')
-      } else {
-        await startProject(projectId)
-        toast.success('All services started')
-      }
-      setProjectState(newState)
-      await loadProject()
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : `Failed to ${newState === 'stopped' ? 'stop' : 'start'} project`
-      toast.error(message)
-    } finally {
-      setChangingState(false)
+    if (newState === 'stopped') {
+      await actions.stopProject()
+    } else {
+      await actions.startProject()
     }
+    setProjectState(newState)
   }
 
   const handleRenameProject = async () => {
@@ -209,35 +139,16 @@ export function ProjectDetail({ projectId, activeTab = 'overview', onTabChange, 
       return
     }
 
-    setSavingName(true)
-    try {
-      await updateProject(projectId, { name: newProjectName.trim() })
-      toast.success('Project renamed successfully')
+    const ok = await actions.updateProject(newProjectName.trim())
+    if (ok) {
       setEditingName(false)
-      await loadProject()
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : 'Failed to rename project'
-      toast.error(message)
-    } finally {
-      setSavingName(false)
     }
   }
 
   const handleDeleteProject = async () => {
     if (deleteConfirmText !== project.name) return
-
-    setDeletingProject(true)
-    try {
-      await deleteProject(projectId)
-      toast.success(`Project "${project.name}" deleted successfully`)
-      onBack()
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : 'Failed to delete project'
-      toast.error(message)
-    } finally {
-      setDeletingProject(false)
-      setShowDeleteProjectModal(false)
-    }
+    await actions.deleteProject(project.name)
+    setShowDeleteProjectModal(false)
   }
 
   const getServiceStatus = useCallback((service) => {
@@ -251,7 +162,7 @@ export function ProjectDetail({ projectId, activeTab = 'overview', onTabChange, 
     return 'offline'
   }, [getRealtimeStatus])
 
-  if (loading) {
+  if (isLoading) {
     return (
       <div className="flex items-center justify-center py-20">
         <div className="text-center">
@@ -266,7 +177,7 @@ export function ProjectDetail({ projectId, activeTab = 'overview', onTabChange, 
     return (
       <ErrorDisplay
         error={error}
-        onRetry={loadProject}
+        onRetry={refetch}
         onBack={onBack}
         title="Project Error"
       />
@@ -541,10 +452,10 @@ export function ProjectDetail({ projectId, activeTab = 'overview', onTabChange, 
                   <TerminalButton
                     variant={projectState === 'running' ? 'danger' : 'primary'}
                     onClick={handleToggleProjectState}
-                    disabled={changingState}
+                    disabled={pending.changingState}
                     className="w-full justify-center"
                   >
-                    {changingState
+                    {pending.changingState
                       ? '[ PROCESSING... ]'
                       : projectState === 'running'
                         ? '[ STOP ALL ]'
@@ -554,7 +465,7 @@ export function ProjectDetail({ projectId, activeTab = 'overview', onTabChange, 
                 )}
                 <TerminalButton
                   variant="secondary"
-                  onClick={loadProject}
+                  onClick={refetch}
                   className="w-full justify-center"
                 >
                   [ REFRESH ]
@@ -661,9 +572,9 @@ export function ProjectDetail({ projectId, activeTab = 'overview', onTabChange, 
                   <TerminalButton
                     variant="primary"
                     onClick={handleRenameProject}
-                    disabled={savingName || !newProjectName.trim() || newProjectName === project.name}
+                    disabled={pending.savingName || !newProjectName.trim() || newProjectName === project.name}
                   >
-                    {savingName ? '[ SAVING... ]' : '[ SAVE ]'}
+                    {pending.savingName ? '[ SAVING... ]' : '[ SAVE ]'}
                   </TerminalButton>
                   <TerminalButton
                     variant="secondary"
@@ -671,7 +582,7 @@ export function ProjectDetail({ projectId, activeTab = 'overview', onTabChange, 
                       setEditingName(false)
                       setNewProjectName(project.name)
                     }}
-                    disabled={savingName}
+                    disabled={pending.savingName}
                   >
                     [ CANCEL ]
                   </TerminalButton>
@@ -740,16 +651,16 @@ export function ProjectDetail({ projectId, activeTab = 'overview', onTabChange, 
             <TerminalButton
               variant="secondary"
               onClick={() => setShowDeleteModal(null)}
-              disabled={deleting}
+              disabled={pending.deletingService}
             >
               [ CANCEL ]
             </TerminalButton>
             <TerminalButton
               variant="danger"
               onClick={() => handleDeleteService(showDeleteModal)}
-              disabled={deleting}
+              disabled={pending.deletingService}
             >
-              {deleting ? '[ DELETING... ]' : '[ DELETE ]'}
+              {pending.deletingService ? '[ DELETING... ]' : '[ DELETE ]'}
             </TerminalButton>
           </div>
         </TerminalModal>
@@ -772,7 +683,7 @@ export function ProjectDetail({ projectId, activeTab = 'overview', onTabChange, 
             <TerminalInput
               value={deleteConfirmText}
               onChange={(e) => setDeleteConfirmText(e.target.value)}
-              placeholder={project.name}
+              placeholder={`type the project name to confirm`}
               className="w-full"
             />
           </div>
@@ -783,16 +694,16 @@ export function ProjectDetail({ projectId, activeTab = 'overview', onTabChange, 
                 setShowDeleteProjectModal(false)
                 setDeleteConfirmText('')
               }}
-              disabled={deletingProject}
+              disabled={pending.deletingProject}
             >
               [ CANCEL ]
             </TerminalButton>
             <TerminalButton
               variant="danger"
               onClick={handleDeleteProject}
-              disabled={deletingProject || deleteConfirmText !== project.name}
+              disabled={pending.deletingProject || deleteConfirmText !== project.name}
             >
-              {deletingProject ? '[ DELETING... ]' : '[ DELETE PROJECT ]'}
+              {pending.deletingProject ? '[ DELETING... ]' : '[ DELETE PROJECT ]'}
             </TerminalButton>
           </div>
         </TerminalModal>

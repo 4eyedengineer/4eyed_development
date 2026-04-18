@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect } from 'react'
 import { TerminalCard, TerminalDivider } from '../components/TerminalCard'
 import { StatusIndicator } from '../components/StatusIndicator'
 import { ErrorDisplay } from '../components/ErrorDisplay'
@@ -7,22 +7,8 @@ import TerminalSpinner from '../components/TerminalSpinner'
 import TerminalTabs from '../components/TerminalTabs'
 import { useToast } from '../components/Toast'
 import { CloneServiceModal } from '../components/CloneServiceModal'
-import {
-  fetchService,
-  triggerDeploy,
-  restartService,
-  validateDockerfile,
-  fetchSuggestedPort,
-  fixServicePort,
-  startService,
-  stopService
-} from '../api/services'
-import { fetchEnvVars } from '../api/envVars'
-import { fetchDeployments } from '../api/deployments'
-import { startDebugSession, fetchServiceDebugSession } from '../api/debug'
-import { ApiError } from '../api/utils'
-import { useDeploymentStatus } from '../hooks/useDeploymentStatus'
-import { useWebSocket } from '../hooks/useWebSocket'
+import { useServiceData } from '../hooks/useServiceData'
+import { useServiceActions } from '../hooks/useServiceActions'
 import { useCopyToClipboard, formatDate, getStatusText } from '../utils'
 
 // Sub-components
@@ -41,51 +27,38 @@ const SERVICE_TABS = [
 ]
 
 export function ServiceDetail({ serviceId, activeTab = 'overview', onTabChange, onBack }) {
-  // Core state
-  const [service, setService] = useState(null)
-  const [envVars, setEnvVars] = useState([])
-  const [deployments, setDeployments] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
+  // Core service data + realtime deployment status (via useServiceData)
+  const {
+    service,
+    envVars,
+    setEnvVars,
+    deployments,
+    debugSession,
+    setDebugSession,
+    isLoading,
+    error,
+    refetch,
+    latestDeploymentId,
+    hasActiveDeployment,
+    deploymentStatus
+  } = useServiceData(serviceId)
 
-  // UI state
+  // UI-only state
   const [showCloneModal, setShowCloneModal] = useState(false)
   const [showBuildLogs, setShowBuildLogs] = useState(false)
-  const [deploying, setDeploying] = useState(false)
-  const [restarting, setRestarting] = useState(false)
   const [showRestartMenu, setShowRestartMenu] = useState(false)
-  const [validating, setValidating] = useState(false)
-  const [validation, setValidation] = useState(null)
-  const [fixingPort, setFixingPort] = useState(false)
-  const [changingState, setChangingState] = useState(false)
-  const [lastNotifiedStatus, setLastNotifiedStatus] = useState(null)
-
-  // Debug session state
-  const [activeDebugSession, setActiveDebugSession] = useState(null)
-  const [startingDebug, setStartingDebug] = useState(false)
 
   const toast = useToast()
   const { copy, copied } = useCopyToClipboard()
-  const { connectionState: wsConnectionState, isConnected: wsIsConnected } = useWebSocket()
 
-  // Get the latest deployment ID for log streaming and WebSocket subscription
-  const latestDeploymentId = deployments[0]?.id
-
-  // Use WebSocket for real-time deployment status updates
-  const {
-    status: wsDeploymentStatus,
-    message: wsDeploymentMessage,
-    isActive: wsIsActive,
-    isComplete: wsIsComplete,
-    isFailed: wsIsFailed
-  } = useDeploymentStatus(latestDeploymentId, deployments[0])
-
-  // Check if any deployment is in progress
-  const hasActiveDeployment = useCallback(() => {
-    if (!deployments.length) return false
-    const latestStatus = wsDeploymentStatus || deployments[0]?.status
-    return ['pending', 'building', 'deploying'].includes(latestStatus)
-  }, [deployments, wsDeploymentStatus])
+  // Actions — collapses per-action pending flags; keeps validation internal
+  const { actions, pending, validation } = useServiceActions(serviceId, {
+    refetch,
+    service,
+    latestDeploymentId,
+    setActiveDebugSession: setDebugSession,
+    onShowBuildLogs: () => setShowBuildLogs(true)
+  })
 
   // Auto-show build logs when a deployment is active
   useEffect(() => {
@@ -94,211 +67,9 @@ export function ServiceDetail({ serviceId, activeTab = 'overview', onTabChange, 
     }
   }, [hasActiveDeployment])
 
-  // Initial load
-  useEffect(() => {
-    if (serviceId) {
-      loadServiceData()
-    }
-  }, [serviceId])
-
-  // Handle WebSocket status updates
-  useEffect(() => {
-    if (!wsDeploymentStatus || !latestDeploymentId) return
-
-    setDeployments(prev => {
-      if (prev.length === 0) return prev
-      const updated = [...prev]
-      if (updated[0]?.id === latestDeploymentId) {
-        updated[0] = { ...updated[0], status: wsDeploymentStatus }
-      }
-      return updated
-    })
-
-    const notifyKey = `${latestDeploymentId}-${wsDeploymentStatus}`
-    if (notifyKey !== lastNotifiedStatus) {
-      if (wsDeploymentStatus === 'live') {
-        toast.success('Deployment completed successfully!')
-        setLastNotifiedStatus(notifyKey)
-        loadServiceData()
-      } else if (wsDeploymentStatus === 'failed') {
-        toast.error('Deployment failed')
-        setLastNotifiedStatus(notifyKey)
-        loadServiceData()
-      }
-    }
-  }, [wsDeploymentStatus, latestDeploymentId, lastNotifiedStatus, toast])
-
-  // Fallback polling when WebSocket is not connected
-  useEffect(() => {
-    if (!serviceId || loading) return
-    if (wsIsConnected()) return
-
-    const hasActive = hasActiveDeployment()
-    if (!hasActive) return
-
-    const interval = setInterval(() => {
-      loadServiceData()
-    }, 5000)
-
-    return () => clearInterval(interval)
-  }, [serviceId, loading, hasActiveDeployment, wsIsConnected])
-
-  const loadServiceData = async () => {
-    try {
-      // Use Promise.allSettled for partial failure resilience
-      const [serviceResult, envResult, deploymentsResult, debugResult] = await Promise.allSettled([
-        fetchService(serviceId),
-        fetchEnvVars(serviceId),
-        fetchDeployments(serviceId),
-        fetchServiceDebugSession(serviceId)
-      ])
-
-      // Service data is critical - if it fails, show error
-      if (serviceResult.status === 'rejected') {
-        const err = serviceResult.reason
-        setError(err instanceof ApiError ? err.message : 'Failed to load service')
-        toast.error('Failed to load service data')
-        return
-      }
-
-      setService(serviceResult.value)
-      setError(null)
-
-      // Env vars - graceful degradation with warning
-      if (envResult.status === 'fulfilled') {
-        setEnvVars(envResult.value)
-      } else {
-        setEnvVars([])
-        toast.warning('Failed to load environment variables')
-      }
-
-      // Deployments - graceful degradation with warning
-      if (deploymentsResult.status === 'fulfilled') {
-        setDeployments(deploymentsResult.value.deployments || [])
-      } else {
-        setDeployments([])
-        toast.warning('Failed to load deployment history')
-      }
-
-      // Debug session - graceful degradation (no warning, not critical)
-      if (debugResult.status === 'fulfilled') {
-        setActiveDebugSession(debugResult.value.session)
-      } else {
-        setActiveDebugSession(null)
-      }
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Failed to load service')
-      toast.error('Failed to load service data')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const handleTriggerDeploy = async () => {
-    setDeploying(true)
-    try {
-      const result = await triggerDeploy(serviceId)
-      toast.success('Deployment triggered')
-      setShowBuildLogs(true)
-      await loadServiceData()
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : 'Failed to trigger deployment'
-      toast.error(message)
-    } finally {
-      setDeploying(false)
-    }
-  }
-
   const handleRestart = async () => {
-    setRestarting(true)
-    try {
-      await restartService(serviceId)
-      toast.success('Service restarted')
-      await loadServiceData()
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : 'Failed to restart service'
-      toast.error(message)
-    } finally {
-      setRestarting(false)
-      setShowRestartMenu(false)
-    }
-  }
-
-  const handleValidate = async () => {
-    setValidating(true)
-    setValidation(null)
-    try {
-      const result = await validateDockerfile(serviceId)
-      setValidation(result)
-      if (result.valid) {
-        toast.success('Dockerfile validated successfully')
-      } else {
-        toast.warning('Dockerfile has issues')
-      }
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : 'Failed to validate Dockerfile'
-      toast.error(message)
-    } finally {
-      setValidating(false)
-    }
-  }
-
-  const handleFixPort = async () => {
-    setFixingPort(true)
-    try {
-      await fixServicePort(serviceId)
-      toast.success('Port updated successfully')
-      await loadServiceData()
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : 'Failed to fix port'
-      toast.error(message)
-    } finally {
-      setFixingPort(false)
-    }
-  }
-
-  const handleStartDebug = async () => {
-    if (!latestDeploymentId) return
-
-    setStartingDebug(true)
-    try {
-      const result = await startDebugSession(latestDeploymentId)
-      setActiveDebugSession({ id: result.sessionId, status: 'running' })
-      toast.success('Debug session started')
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : 'Failed to start debug session'
-      toast.error(message)
-    } finally {
-      setStartingDebug(false)
-    }
-  }
-
-  const handleDebugRetry = (newSessionId) => {
-    setActiveDebugSession({ id: newSessionId, status: 'running' })
-    toast.success('New debug session started')
-  }
-
-  const handleToggleState = async () => {
-    if (changingState) return
-
-    const isRunning = service?.latest_deployment?.status === 'live'
-    setChangingState(true)
-
-    try {
-      if (isRunning) {
-        await stopService(serviceId)
-        toast.success('Service stopped')
-      } else {
-        await startService(serviceId)
-        toast.success('Service started')
-      }
-      await loadServiceData()
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : 'Failed to change service state'
-      toast.error(message)
-    } finally {
-      setChangingState(false)
-    }
+    await actions.restart()
+    setShowRestartMenu(false)
   }
 
   const getServiceStatusIndicator = () => {
@@ -311,7 +82,7 @@ export function ServiceDetail({ serviceId, activeTab = 'overview', onTabChange, 
     return 'offline'
   }
 
-  if (loading) {
+  if (isLoading) {
     return (
       <div className="flex items-center justify-center py-20">
         <div className="text-center">
@@ -326,7 +97,7 @@ export function ServiceDetail({ serviceId, activeTab = 'overview', onTabChange, 
     return (
       <ErrorDisplay
         error={error}
-        onRetry={loadServiceData}
+        onRetry={refetch}
         onBack={onBack}
         title="Service Error"
       />
@@ -338,6 +109,8 @@ export function ServiceDetail({ serviceId, activeTab = 'overview', onTabChange, 
   }
 
   const isRunning = service?.latest_deployment?.status === 'live'
+  const wsDeploymentStatus = deploymentStatus.status
+  const wsIsConnected = deploymentStatus.isConnected
 
   return (
     <div className="space-y-6">
@@ -363,7 +136,7 @@ export function ServiceDetail({ serviceId, activeTab = 'overview', onTabChange, 
             {hasActiveDeployment() && (
               <span className="font-mono text-xs text-terminal-cyan animate-pulse flex items-center gap-1">
                 <span className="inline-block w-2 h-2 bg-terminal-cyan rounded-full animate-ping" />
-                {wsIsConnected() ? 'DEPLOYING (LIVE)' : 'DEPLOYING'}
+                {wsIsConnected ? 'DEPLOYING (LIVE)' : 'DEPLOYING'}
               </span>
             )}
             {service.url && (
@@ -382,10 +155,10 @@ export function ServiceDetail({ serviceId, activeTab = 'overview', onTabChange, 
         <div className="flex gap-2 flex-wrap">
           <TerminalButton
             variant="secondary"
-            onClick={handleValidate}
-            disabled={validating}
+            onClick={actions.validate}
+            disabled={pending.validate}
           >
-            {validating ? '[ VALIDATING... ]' : '[ VALIDATE ]'}
+            {pending.validate ? '[ VALIDATING... ]' : '[ VALIDATE ]'}
           </TerminalButton>
           <TerminalButton
             variant="secondary"
@@ -395,25 +168,25 @@ export function ServiceDetail({ serviceId, activeTab = 'overview', onTabChange, 
           </TerminalButton>
           <TerminalButton
             variant={isRunning ? 'danger' : 'secondary'}
-            onClick={handleToggleState}
-            disabled={changingState || hasActiveDeployment()}
+            onClick={actions.toggleState}
+            disabled={pending.changingState || hasActiveDeployment()}
           >
-            {changingState ? '[ ... ]' : isRunning ? '[ STOP ]' : '[ START ]'}
+            {pending.changingState ? '[ ... ]' : isRunning ? '[ STOP ]' : '[ START ]'}
           </TerminalButton>
           <TerminalButton
             variant="primary"
-            onClick={handleTriggerDeploy}
-            disabled={deploying || hasActiveDeployment()}
+            onClick={actions.deploy}
+            disabled={pending.deploy || hasActiveDeployment()}
           >
-            {deploying ? '[ DEPLOYING... ]' : '[ DEPLOY ]'}
+            {pending.deploy ? '[ DEPLOYING... ]' : '[ DEPLOY ]'}
           </TerminalButton>
           <div className="relative">
             <TerminalButton
               variant="secondary"
               onClick={() => setShowRestartMenu(!showRestartMenu)}
-              disabled={restarting}
+              disabled={pending.restart}
             >
-              {restarting ? '[ RESTARTING... ]' : '[ RESTART ]'}
+              {pending.restart ? '[ RESTARTING... ]' : '[ RESTART ]'}
             </TerminalButton>
             {showRestartMenu && (
               <div className="absolute right-0 mt-1 z-10 border border-terminal-border bg-terminal-bg-secondary p-2">
@@ -450,15 +223,15 @@ export function ServiceDetail({ serviceId, activeTab = 'overview', onTabChange, 
           showBuildLogs={showBuildLogs}
           hasActiveDeployment={hasActiveDeployment()}
           validation={validation}
-          onFixPort={handleFixPort}
-          fixingPort={fixingPort}
-          onDeploy={handleTriggerDeploy}
-          deploying={deploying}
-          onRefresh={loadServiceData}
-          activeDebugSession={activeDebugSession}
-          onStartDebug={handleStartDebug}
-          startingDebug={startingDebug}
-          onDebugRetry={handleDebugRetry}
+          onFixPort={actions.fixPort}
+          fixingPort={pending.fixPort}
+          onDeploy={actions.deploy}
+          deploying={pending.deploy}
+          onRefresh={refetch}
+          activeDebugSession={debugSession}
+          onStartDebug={actions.startDebug}
+          startingDebug={pending.startingDebug}
+          onDebugRetry={actions.handleDebugRetry}
         />
       )}
 
@@ -481,7 +254,7 @@ export function ServiceDetail({ serviceId, activeTab = 'overview', onTabChange, 
         <ServiceLogs
           serviceId={serviceId}
           latestDeploymentId={latestDeploymentId}
-          onRefresh={loadServiceData}
+          onRefresh={refetch}
         />
       )}
 
@@ -490,9 +263,9 @@ export function ServiceDetail({ serviceId, activeTab = 'overview', onTabChange, 
           serviceId={serviceId}
           deployments={deployments}
           hasActiveDeployment={hasActiveDeployment()}
-          onDeploy={handleTriggerDeploy}
-          deploying={deploying}
-          onRefresh={loadServiceData}
+          onDeploy={actions.deploy}
+          deploying={pending.deploy}
+          onRefresh={refetch}
         />
       )}
 
