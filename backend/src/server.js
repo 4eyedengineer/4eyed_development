@@ -8,6 +8,11 @@ import websocketHubPlugin from './plugins/websocket-hub.js';
 import authRoutes from './routes/auth.js';
 import projectRoutes from './routes/projects.js';
 import serviceRoutes from './routes/services.js';
+import serviceDeploymentRoutes from './routes/serviceDeployments.js';
+import serviceEnvRoutes from './routes/serviceEnv.js';
+import serviceLogRoutes from './routes/serviceLogs.js';
+import serviceMetricRoutes from './routes/serviceMetrics.js';
+import serviceDockerfileRoutes from './routes/serviceDockerfile.js';
 import deploymentRoutes from './routes/deployments.js';
 import webhookRoutes from './routes/webhooks.js';
 import githubRoutes from './routes/github.js';
@@ -102,8 +107,15 @@ fastify.register(authRoutes);
 // Register project routes
 fastify.register(projectRoutes);
 
-// Register service routes
+// Register service routes (core CRUD)
 fastify.register(serviceRoutes);
+
+// Register service sub-route plugins (deployments, env, logs, metrics, dockerfile)
+fastify.register(serviceDeploymentRoutes);
+fastify.register(serviceEnvRoutes);
+fastify.register(serviceLogRoutes);
+fastify.register(serviceMetricRoutes);
+fastify.register(serviceDockerfileRoutes);
 
 // Register deployment routes
 fastify.register(deploymentRoutes);
