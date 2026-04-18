@@ -493,7 +493,7 @@ async function rebuildWithChanges(db, sessionId, service, deployment, fileChange
  */
 async function triggerDebugBuild(db, service, deployment, commitSha, githubToken, namespace, configMapName) {
   const { applyManifest, createSecret, deleteSecret } = await import('./kubernetes.js');
-  const { generateKanikoJobManifestGenerated } = await import('./manifestGenerator.js');
+  const { generateKanikoJobManifest } = await import('./manifestGenerator.js');
   const { parseGitHubUrl } = await import('./github.js');
 
   await updateDeploymentStatus(db, deployment.id, 'building');
@@ -523,13 +523,13 @@ async function triggerDebugBuild(db, service, deployment, commitSha, githubToken
     };
     await createSecret(namespace, gitSecretName, gitSecretData);
 
-    // Generate Kaniko job using the debug ConfigMap
-    const jobManifest = generateKanikoJobManifestGenerated({
+    const jobManifest = generateKanikoJobManifest({
       namespace,
       jobName,
       repoUrl,
       branch: service.branch,
       commitSha,
+      dockerfilePath: '/workspace/Dockerfile',
       imageDest: imageTag,
       gitSecretName,
       registrySecretName: REGISTRY_SECRET_NAME,
