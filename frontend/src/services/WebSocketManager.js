@@ -17,6 +17,10 @@ class WebSocketManager {
     this.reconnectTimeout = null;
     this.pingInterval = null;
     this.lastPong = null;
+    // Dedup server-side error messages to prevent console spam
+    // (e.g. repeated auth rejections across many channels). Tracks
+    // "<channel>::<message>" strings already logged this session.
+    this.loggedErrors = new Set();
 
     // Cross-tab coordination
     this.broadcastChannel = null;
@@ -251,9 +255,18 @@ class WebSocketManager {
       case 'pong':
         this.lastPong = Date.now();
         break;
-      case 'error':
-        console.error('[WebSocket] Server error:', message.error);
+      case 'error': {
+        // Dedup repeated server errors (e.g. auth rejections fired once
+        // per subscribed channel). Log each unique (channel, message)
+        // pair once per session; silently drop repeats.
+        const errKey = `${channel || '*'}::${message.error}`;
+        if (!this.loggedErrors.has(errKey)) {
+          this.loggedErrors.add(errKey);
+          console.error('[WebSocket] Server error:', message.error,
+            channel ? `(channel: ${channel})` : '');
+        }
         break;
+      }
     }
   }
 

@@ -392,14 +392,10 @@ const [copySuccess, setCopySuccess] = useState(false);
     );
   }
 
-  // Default/Unknown state
-  return (
-    <TerminalCard title="DEBUG SESSION" variant="default" className={className}>
-      <div className="text-terminal-muted font-mono text-sm">
-        Status: {session.status || 'unknown'}
-      </div>
-    </TerminalCard>
-  );
+  // No meaningful state to show — render nothing rather than a confusing
+  // "Status: unknown" stub. This happens when the WS hook hasn't hydrated
+  // and the session is in a terminal/unknown state with no live updates.
+  return null;
 }
 
 DebugSessionViewer.propTypes = {

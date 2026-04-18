@@ -21,6 +21,7 @@ export function NewServiceForm({ projectId, onSubmit, onCancel }) {
 
   const [errors, setErrors] = useState({})
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
 
   const serviceTypes = [
     { value: 'container', label: 'Container' },
@@ -229,6 +230,20 @@ export function NewServiceForm({ projectId, onSubmit, onCancel }) {
           </div>
         </TerminalCard>
 
+        {/* Advanced toggle — boundary between essential and advanced fields */}
+        <div className="flex justify-center">
+          <button
+            type="button"
+            onClick={() => setShowAdvanced(prev => !prev)}
+            className="font-mono text-sm text-terminal-secondary hover:text-terminal-primary transition-colors uppercase tracking-terminal-wide"
+            aria-expanded={showAdvanced}
+          >
+            {showAdvanced ? '[-] HIDE ADVANCED' : '[+] SHOW ADVANCED'}
+          </button>
+        </div>
+
+        {showAdvanced && (
+        <>
         {/* Resource Allocation */}
         <TerminalCard title="Resource Allocation" variant="amber">
           <div className="space-y-6">
@@ -340,6 +355,8 @@ export function NewServiceForm({ projectId, onSubmit, onCancel }) {
             </button>
           </div>
         </TerminalCard>
+        </>
+        )}
 
         {/* Form Actions */}
         <TerminalDivider variant="single" color="muted" />

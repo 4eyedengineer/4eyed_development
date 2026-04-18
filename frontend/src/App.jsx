@@ -211,27 +211,10 @@ function AppContent() {
     const projectMatch = path.match(/^\/projects\/([^/]+)/)
     const serviceMatch = path.match(/^\/services\/([^/]+)/)
 
-    if (projectMatch) {
-      const projectId = projectMatch[1]
-      if (projectId === 'new') return [] // No sidebar for new project wizard
-      const basePath = `/projects/${projectId}`
-      return [
-        { label: 'Overview', href: basePath },
-        { label: 'Services', href: `${basePath}/services` },
-        { label: 'Logs', href: `${basePath}/logs` },
-        { label: 'Settings', href: `${basePath}/settings` }
-      ]
-    }
-    if (serviceMatch) {
-      const serviceId = serviceMatch[1]
-      const basePath = `/services/${serviceId}`
-      return [
-        { label: 'Overview', href: basePath },
-        { label: 'Config', href: `${basePath}/config` },
-        { label: 'Environment', href: `${basePath}/env` },
-        { label: 'Logs', href: `${basePath}/logs` },
-        { label: 'History', href: `${basePath}/history` }
-      ]
+    // Detail pages render their own TerminalTabs row, so we suppress the
+    // context sidebar on project/service routes to avoid duplicate nav.
+    if (projectMatch || serviceMatch) {
+      return []
     }
     // Dashboard - no navigation sidebar needed
     return []

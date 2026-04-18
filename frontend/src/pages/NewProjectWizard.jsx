@@ -492,7 +492,15 @@ export function NewProjectWizard({ onComplete, onCancel }) {
       {/* Header */}
       <div className="flex items-center gap-4">
         <button
-          onClick={onCancel}
+          onClick={() => {
+            // If past the first step, step back through the wizard preserving form state.
+            // Only leave the wizard (cancel) when already on the first step.
+            if (currentStep > STEPS.NAME) {
+              handleBack()
+            } else {
+              onCancel()
+            }
+          }}
           className="font-mono text-terminal-secondary hover:text-terminal-primary transition-colors"
         >
           &lt; BACK

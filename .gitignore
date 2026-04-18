@@ -10,3 +10,6 @@ dist/
 
 # Lock files (optional - some prefer to commit these)
 package-lock.json
+
+# Playwright test screenshots
+*.png

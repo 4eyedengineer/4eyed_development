@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import TerminalButton from './TerminalButton'
 import TerminalInput from './TerminalInput'
 import TerminalSelect from './TerminalSelect'
+import TerminalCheckbox from './TerminalCheckbox'
 import { fetchProjects } from '../api/projects'
 import { cloneService } from '../api/services'
 import { ApiError } from '../api/utils'
@@ -102,29 +103,17 @@ export function CloneServiceModal({ service, onClose, onCloned }) {
 
             {/* Options */}
             <div className="mb-4 space-y-3">
-              <label className="flex items-center gap-3 cursor-pointer group">
-                <input
-                  type="checkbox"
-                  checked={includeEnv}
-                  onChange={(e) => setIncludeEnv(e.target.checked)}
-                  className="w-4 h-4 accent-terminal-green bg-terminal-bg-secondary border border-terminal-border cursor-pointer"
-                />
-                <span className="font-mono text-sm text-terminal-primary group-hover:text-terminal-green transition-colors">
-                  Copy environment variables
-                </span>
-              </label>
+              <TerminalCheckbox
+                checked={includeEnv}
+                onChange={(e) => setIncludeEnv(e.target.checked)}
+                label="Copy environment variables"
+              />
 
-              <label className="flex items-center gap-3 cursor-pointer group">
-                <input
-                  type="checkbox"
-                  checked={autoDeploy}
-                  onChange={(e) => setAutoDeploy(e.target.checked)}
-                  className="w-4 h-4 accent-terminal-green bg-terminal-bg-secondary border border-terminal-border cursor-pointer"
-                />
-                <span className="font-mono text-sm text-terminal-primary group-hover:text-terminal-green transition-colors">
-                  Deploy immediately after creation
-                </span>
-              </label>
+              <TerminalCheckbox
+                checked={autoDeploy}
+                onChange={(e) => setAutoDeploy(e.target.checked)}
+                label="Deploy immediately after creation"
+              />
             </div>
 
             {/* Warning for env vars */}

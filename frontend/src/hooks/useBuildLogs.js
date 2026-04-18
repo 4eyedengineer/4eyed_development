@@ -22,7 +22,8 @@ export function useBuildLogs(deploymentId, enabled = true) {
     // Build WebSocket URL
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const apiUrl = new URL(API_BASE_URL, window.location.origin)
-    const wsUrl = `${wsProtocol}//${apiUrl.host}${apiUrl.pathname}/deployments/${deploymentId}/logs`
+    const basePath = apiUrl.pathname === '/' ? '' : apiUrl.pathname.replace(/\/$/, '')
+    const wsUrl = `${wsProtocol}//${apiUrl.host}${basePath}/deployments/${deploymentId}/logs`
 
     setStatus('connecting')
     setStatusMessage('Connecting to build logs...')
