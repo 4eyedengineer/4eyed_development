@@ -89,6 +89,11 @@ spec:
                 secretKeyRef:
                   name: dangus-secrets
                   key: SESSION_SECRET
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: dangus-secrets
+                  key: ANTHROPIC_API_KEY
           resources:
             requests:
               memory: "128Mi"
