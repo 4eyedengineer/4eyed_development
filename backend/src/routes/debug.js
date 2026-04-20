@@ -310,6 +310,7 @@ export default async function debugRoutes(fastify, options) {
         succeeded: a.succeeded,
         buildLogs: a.build_logs,
         tokensUsed: a.tokens_used,
+        gitDiff: a.git_diff,
         createdAt: a.created_at,
       })),
     };

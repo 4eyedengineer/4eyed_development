@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { getRepoTree, getFileContent, parseGitHubUrl } from './github.js';
 import { getGeneratedFile } from './dockerfileGenerator.js';
 import { upsertConfigMap, deleteConfigMap, getPodLogs, getPodEvents, getPodHealth, getDeploymentSpec } from './kubernetes.js';
@@ -9,6 +10,8 @@ import { triggerBuild, watchBuildJob, captureBuildLogs, deployService, getDecryp
 import { updateDeploymentStatus } from './deploymentService.js';
 import { runAgent } from './agentRunner.js';
 import { createFilesystemTools } from './tools/filesystem.js';
+import { createCommandTool } from './tools/command.js';
+import { createSandbox, destroySandbox } from './sandboxPod.js';
 import appEvents from './event-emitter.js';
 import logger from './logger.js';
 
@@ -42,13 +45,17 @@ Workflow:
 4. When done, call submit_fix with the list of relative paths you modified plus a short explanation.
 5. If the issue cannot be fixed by editing files (source bugs, missing external deps, secrets, resource limits, infra config), call request_manual_fix with clear suggestedActions instead.
 
+You also have a \`run_command\` tool that executes shell commands in a sandbox with the repo files mounted. USE IT AGGRESSIVELY before proposing fixes. Example moves: \`npm ls\` to check installed deps vs imports, \`npx tsc --noEmit\` to reproduce TypeScript errors in seconds instead of minutes, \`cat package.json\` to read from within the build context, \`find . -name 'package.json' -not -path '*/node_modules/*'\` to discover monorepo structure, \`npm run build\` to reproduce the exact failure locally. Every Kaniko rebuild costs 5-10 minutes — running commands costs seconds. Prefer running commands over guessing.
+
 SAFETY:
 - NEVER create or modify .env, secrets, credentials, or keys
 - Write COMPLETE file contents when using write_file (no diffs / no placeholders / no "..." truncation)
 - Only modify files you understand the role of
 - Prefer the smallest fix that addresses the root cause
 
-End your turn immediately after calling submit_fix or request_manual_fix.`;
+End your turn immediately after calling submit_fix or request_manual_fix.
+
+When the error references a module import ('Cannot find module X', 'No matching version for X'), consider BOTH (a) adding the correct npm package name to package.json, and (b) changing the import specifier in the source files. If package.json fixes alone don't resolve the error, read the actual import statements in the source (.ts, .js, .tsx, .jsx) and verify they reference a real package. Use read_file and search to find the imports, then write_file or str_replace to correct them.`;
 
 /**
  * Determine the failure phase based on deployment and pod state
@@ -203,6 +210,7 @@ export async function runDebugLoop(db, session, service, deployment, githubToken
         buildLogs,
         repoSnapshot,
         previousAttempts: attempts,
+        namespace,
       });
 
       const attemptRecord = await createAttempt(db, session.id, attempt, llmResult);
@@ -319,8 +327,9 @@ export async function runDebugLoop(db, session, service, deployment, githubToken
  * model explore and edit via tools, then returns the modified-file set
  * by reading them back from disk.
  */
-async function runDebugAgent({ sessionId, attempt, service, deployment, buildLogs, repoSnapshot, previousAttempts }) {
+async function runDebugAgent({ sessionId, attempt, service, deployment, buildLogs, repoSnapshot, previousAttempts, namespace }) {
   const sandboxDir = await createSandboxDir(`debug-${sessionId}-${attempt}`);
+  let sandboxPod = null;
 
   try {
     // Seed sandbox: repo files + tree + diagnostic context.
@@ -335,6 +344,18 @@ async function runDebugAgent({ sessionId, attempt, service, deployment, buildLog
     const phase = (deployment.status === 'failed' && buildLogs) ? 'build' : 'startup';
     await fs.writeFile(path.join(sandboxDir, 'PHASE.txt'), phase, 'utf8');
     await fs.writeFile(path.join(sandboxDir, 'BUILD_LOGS.txt'), String(buildLogs || 'No build logs available'), 'utf8');
+
+    // Write .gitignore BEFORE initializing git so diagnostic-only files don't
+    // pollute the baseline commit or show up in the agent's final diff.
+    await fs.writeFile(
+      path.join(sandboxDir, '.gitignore'),
+      [...INJECTED_DIAGNOSTIC_FILES].join('\n') + '\n',
+      'utf8',
+    );
+
+    // Git-initialize the sandbox so we can produce a real `git diff` of the
+    // agent's changes as a human-facing artifact. Pure local repo — never pushed.
+    initSandboxGit(sandboxDir);
 
     // Snapshot file mtimes so we can detect what the agent modified, even if
     // the agent forgets to declare them in modifiedFiles.
@@ -385,11 +406,32 @@ async function runDebugAgent({ sessionId, attempt, service, deployment, buildLog
       },
     };
 
+    // Spin up an ephemeral Pod mirroring the local sandbox so the agent can
+    // run `npm ls`, `tsc --noEmit`, etc. in seconds. If the pod fails to come
+    // up (quota, image pull, etc.) we log a warning and continue without the
+    // run_command tool — the agent can still use the filesystem tools.
+    if (namespace) {
+      try {
+        sandboxPod = await createSandbox({ namespace, sessionId: `${sessionId}-${attempt}` });
+      } catch (err) {
+        logger.warn({ sessionId, attempt, err: err.message },
+          'Failed to provision sandbox pod; continuing without run_command tool');
+        sandboxPod = null;
+      }
+    }
+
     const tools = [
       ...createFilesystemTools(sandboxDir, { writable: true }),
       submitFix,
       requestManual,
     ];
+    if (sandboxPod) {
+      tools.push(createCommandTool({
+        namespace: sandboxPod.namespace,
+        podName: sandboxPod.podName,
+        localSandboxDir: sandboxDir,
+      }));
+    }
 
     const initialMessage = buildDebugInitialMessage({
       service,
@@ -445,11 +487,18 @@ async function runDebugAgent({ sessionId, attempt, service, deployment, buildLog
       }
     }
 
+    // Capture a unified git diff against the seed commit BEFORE the Kaniko
+    // rebuild — this is the human-facing artifact the UI will render.
+    // Also commit the agent's edits on top of the seed so future attempts
+    // (or humans) can inspect the delta chain.
+    const gitDiff = captureSandboxDiff(sandboxDir, attempt);
+
     if (!outcome) {
       // Agent ran out of iterations / hit token budget without submitting.
       return {
         explanation: `Agent did not complete (stop_reason=${agentResult.stopReason}, iterations=${agentResult.iterations}). ${fileChanges.length} file(s) were modified but not formally submitted.`,
         fileChanges,
+        gitDiff,
         needsManualFix: fileChanges.length === 0,
         suggestedActions: fileChanges.length === 0 ? ['Inspect build logs and fix manually'] : [],
         tokensUsed,
@@ -459,11 +508,15 @@ async function runDebugAgent({ sessionId, attempt, service, deployment, buildLog
     return {
       explanation: outcome.explanation || 'No explanation provided',
       fileChanges,
+      gitDiff,
       needsManualFix: false,
       tokensUsed,
     };
   } finally {
     await cleanupSandbox(sandboxDir);
+    if (sandboxPod) {
+      await destroySandbox(sandboxPod);
+    }
   }
 }
 
@@ -556,6 +609,80 @@ const INJECTED_DIAGNOSTIC_FILES = new Set([
 
 function isInjectedDiagnosticPath(rel) {
   return INJECTED_DIAGNOSTIC_FILES.has(rel);
+}
+
+/**
+ * Run a git subcommand in the sandbox with no shell interpolation.
+ * Returns stdout as a utf8 string. Throws on non-zero exit unless
+ * `allowFailure` is true (in which case returns empty string).
+ */
+function git(sandboxDir, args, { allowFailure = false } = {}) {
+  try {
+    return execFileSync('git', args, {
+      cwd: sandboxDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 32 * 1024 * 1024,
+      // Avoid inheriting the host user's global git config (GPG signing,
+      // commit.template, hooks, etc) — we want a hermetic local repo.
+      env: {
+        ...process.env,
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_CONFIG_SYSTEM: '/dev/null',
+        HOME: sandboxDir,
+      },
+    });
+  } catch (err) {
+    if (allowFailure) return '';
+    throw err;
+  }
+}
+
+/**
+ * Initialize a local git repo in the sandbox and commit the seeded files as
+ * the baseline. Uses a repo-local user.name / user.email so no host config
+ * is required.
+ */
+function initSandboxGit(sandboxDir) {
+  try {
+    git(sandboxDir, ['init', '-q', '-b', 'main']);
+    git(sandboxDir, ['config', 'user.name', 'dangus-agent']);
+    git(sandboxDir, ['config', 'user.email', 'dangus-agent@local']);
+    git(sandboxDir, ['config', 'commit.gpgsign', 'false']);
+    git(sandboxDir, ['add', '-A']);
+    git(sandboxDir, ['commit', '-q', '--allow-empty', '-m', 'seed: repo snapshot + diagnostics']);
+  } catch (err) {
+    logger.warn({ err: err.message }, 'initSandboxGit failed — diff capture will be disabled for this attempt');
+  }
+}
+
+/**
+ * Produce a unified git patch of everything the agent changed in the sandbox
+ * relative to the seed commit (tracked diffs + untracked additions), then
+ * commit the agent's changes so the HEAD advances. Returns a string safe to
+ * store in the `git_diff` column; empty string if git isn't available.
+ */
+function captureSandboxDiff(sandboxDir, attemptNumber) {
+  try {
+    // Stage everything so `git diff --cached HEAD` includes untracked files.
+    git(sandboxDir, ['add', '-A']);
+
+    const diff = git(sandboxDir, ['diff', '--cached', '--unified=3', 'HEAD'], { allowFailure: true });
+    const status = git(sandboxDir, ['status', '--porcelain'], { allowFailure: true });
+
+    // Only commit if there's actually something staged.
+    if (status.trim().length > 0) {
+      git(sandboxDir, [
+        'commit', '-q', '--allow-empty',
+        '-m', `agent fix attempt ${attemptNumber}`,
+      ], { allowFailure: true });
+    }
+
+    return diff || '';
+  } catch (err) {
+    logger.warn({ err: err.message, attemptNumber }, 'captureSandboxDiff failed');
+    return '';
+  }
 }
 
 /**
@@ -836,15 +963,16 @@ async function updateSessionError(db, sessionId, errorMessage) {
 
 async function createAttempt(db, sessionId, attemptNumber, llmResult) {
   const result = await db.query(`
-    INSERT INTO debug_attempts (session_id, attempt_number, explanation, file_changes, succeeded, tokens_used)
-    VALUES ($1, $2, $3, $4, false, $5)
+    INSERT INTO debug_attempts (session_id, attempt_number, explanation, file_changes, succeeded, tokens_used, git_diff)
+    VALUES ($1, $2, $3, $4, false, $5, $6)
     RETURNING *
   `, [
     sessionId,
     attemptNumber,
     llmResult.explanation,
     JSON.stringify(llmResult.fileChanges),
-    llmResult.tokensUsed || 0
+    llmResult.tokensUsed || 0,
+    llmResult.gitDiff || null,
   ]);
 
   return result.rows[0];

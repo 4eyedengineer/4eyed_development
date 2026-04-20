@@ -249,6 +249,30 @@ export function generateKanikoJobManifest(options) {
 }
 
 /**
+ * Generate an ephemeral sandbox Pod manifest used by the ReAct debug agent
+ * for running shell commands against a mirrored copy of the repo files.
+ *
+ * @param {object} options - Sandbox pod configuration
+ * @param {string} options.podName - Unique pod name
+ * @param {string} options.namespace - Kubernetes namespace
+ * @param {string} options.imageTag - Container image (e.g. 'node:20-bookworm-slim')
+ * @param {string} options.sessionId - Debug session ID (used as label)
+ * @returns {object} Parsed Kubernetes manifest object
+ */
+export function generateSandboxPodManifest(options) {
+  const required = ['podName', 'namespace', 'imageTag', 'sessionId'];
+  for (const field of required) {
+    if (!(field in options)) {
+      throw new Error(`Missing required option: ${field}`);
+    }
+  }
+
+  const template = loadTemplate('sandbox-pod.yaml.tpl');
+  const yaml = interpolate(template, options);
+  return parse(yaml);
+}
+
+/**
  * Generate a Kubernetes Ingress manifest for custom domains with TLS
  * @param {object} options - Domain Ingress configuration
  * @param {string} options.namespace - Kubernetes namespace

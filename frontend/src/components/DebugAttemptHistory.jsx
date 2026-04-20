@@ -155,6 +155,37 @@ export function DebugAttemptHistory({ sessionId, onClose }) {
                           </pre>
                         </div>
                       )}
+
+                      {/* Git diff (unified patch) — the human-readable artifact */}
+                      {attempt.gitDiff && (
+                        <div className="mt-3">
+                          <div className="font-mono text-xs text-terminal-cyan uppercase mb-1">
+                            Git Diff
+                          </div>
+                          <pre className="font-mono text-xs bg-terminal-bg-alt p-2 overflow-x-auto max-h-96 border border-terminal-border">
+                            {attempt.gitDiff.split('\n').map((line, idx) => {
+                              let color = 'text-terminal-muted';
+                              if (line.startsWith('+++') || line.startsWith('---')) {
+                                color = 'text-terminal-cyan';
+                              } else if (line.startsWith('@@')) {
+                                color = 'text-terminal-secondary';
+                              } else if (line.startsWith('+')) {
+                                color = 'text-terminal-primary';
+                              } else if (line.startsWith('-')) {
+                                color = 'text-terminal-red';
+                              } else if (line.startsWith('diff --git') || line.startsWith('index ')) {
+                                color = 'text-terminal-secondary';
+                              }
+                              return (
+                                <span key={idx} className={color}>
+                                  {line}
+                                  {'\n'}
+                                </span>
+                              );
+                            })}
+                          </pre>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

@@ -171,6 +171,8 @@ export async function applyManifest(manifest) {
     path = `/apis/batch/v1/namespaces/${namespace}/jobs`;
   } else if (apiVersion === 'v1' && kind === 'Secret') {
     path = `/api/v1/namespaces/${namespace}/secrets`;
+  } else if (apiVersion === 'v1' && kind === 'Pod') {
+    path = `/api/v1/namespaces/${namespace}/pods`;
   } else {
     throw new Error(`Unsupported manifest kind: ${kind}`);
   }
@@ -754,6 +756,177 @@ export async function checkNamespaceStatus(name) {
  * @param {function} checkDbProject - Async function that returns true if a DB project exists for this namespace
  * @returns {Promise<{created: boolean, reclaimed: boolean, namespace: object}>}
  */
+/**
+ * Get a Pod by name.
+ */
+export async function getPod(namespace, name) {
+  return k8sRequest('GET', `/api/v1/namespaces/${namespace}/pods/${name}`);
+}
+
+/**
+ * Delete a Pod. Best-effort; swallows 404s.
+ */
+export async function deletePod(namespace, name, { gracePeriodSeconds = 0 } = {}) {
+  const qs = `?gracePeriodSeconds=${gracePeriodSeconds}`;
+  return k8sRequest('DELETE', `/api/v1/namespaces/${namespace}/pods/${name}${qs}`);
+}
+
+/**
+ * Apply a Pod manifest and poll until it reaches Ready (or timeout).
+ * Returns the ready Pod object. Throws on timeout or terminal failure.
+ */
+export async function applyAndWaitPodReady(manifest, { timeoutMs = 90_000, pollIntervalMs = 1500 } = {}) {
+  await applyManifest(manifest);
+  const { namespace, name } = manifest.metadata;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    let pod;
+    try {
+      pod = await getPod(namespace, name);
+    } catch (err) {
+      if (err.status === 404) {
+        // Not yet indexed; wait and retry
+        await new Promise(r => setTimeout(r, pollIntervalMs));
+        continue;
+      }
+      throw err;
+    }
+    const phase = pod.status?.phase;
+    if (phase === 'Failed' || phase === 'Succeeded') {
+      throw new Error(`Pod ${name} reached terminal phase ${phase} before Ready`);
+    }
+    const readyCond = (pod.status?.conditions || []).find(c => c.type === 'Ready');
+    if (readyCond?.status === 'True') {
+      return pod;
+    }
+    await new Promise(r => setTimeout(r, pollIntervalMs));
+  }
+  throw new Error(`Pod ${name} did not become Ready within ${timeoutMs}ms`);
+}
+
+/**
+ * Exec a command inside a running Pod.
+ *
+ * Wraps @kubernetes/client-node's Exec. Accumulates stdout/stderr into Buffers,
+ * supports optional stdin, and enforces a timeout by calling WebSocket.close().
+ *
+ * @param {string} namespace
+ * @param {string} podName
+ * @param {string[]} command - Argv (e.g. ['sh', '-c', 'ls -la'])
+ * @param {object} [opts]
+ * @param {string} [opts.containerName]
+ * @param {number} [opts.timeoutMs=120000]
+ * @param {Buffer|string|null} [opts.stdin] - Optional stdin payload
+ * @returns {Promise<{stdout: Buffer, stderr: Buffer, exitCode: number|null, timedOut: boolean}>}
+ */
+export async function execInPod(namespace, podName, command, opts = {}) {
+  const {
+    containerName,
+    timeoutMs = 120_000,
+    stdin = null,
+  } = opts;
+
+  // Lazy-load to avoid pulling the dep at module-init for non-exec paths.
+  const k8sClient = await import('@kubernetes/client-node');
+  const kc = new k8sClient.KubeConfig();
+  try {
+    kc.loadFromCluster();
+    // If running out-of-cluster with a token env var, patch the context.
+    if (!kc.getCurrentCluster() && process.env.KUBERNETES_TOKEN) {
+      kc.loadFromOptions({
+        clusters: [{ name: 'default', server: K8S_API_SERVER, skipTLSVerify: !getCA() }],
+        users: [{ name: 'default', token: process.env.KUBERNETES_TOKEN }],
+        contexts: [{ name: 'default', cluster: 'default', user: 'default' }],
+        currentContext: 'default',
+      });
+    }
+  } catch {
+    kc.loadFromDefault();
+  }
+
+  const exec = new k8sClient.Exec(kc);
+  const stdoutChunks = [];
+  const stderrChunks = [];
+
+  // Use PassThrough so Exec can pipe into them.
+  const { PassThrough } = await import('node:stream');
+  const stdoutStream = new PassThrough();
+  const stderrStream = new PassThrough();
+  stdoutStream.on('data', c => stdoutChunks.push(Buffer.from(c)));
+  stderrStream.on('data', c => stderrChunks.push(Buffer.from(c)));
+
+  let stdinStream = null;
+  if (stdin !== null && stdin !== undefined) {
+    const buf = Buffer.isBuffer(stdin) ? stdin : Buffer.from(String(stdin), 'utf8');
+    stdinStream = new PassThrough();
+    // Queue write + end; Exec reads it once the connection is open.
+    stdinStream.end(buf);
+  }
+
+  let exitCode = null;
+  let timedOut = false;
+  let ws = null;
+
+  const done = new Promise((resolve, reject) => {
+    exec.exec(
+      namespace,
+      podName,
+      containerName || '',
+      command,
+      stdoutStream,
+      stderrStream,
+      stdinStream,
+      false, // tty
+      (status) => {
+        // status: V1Status — exitCode shows up in status.details.causes or message
+        if (status?.status === 'Success') {
+          exitCode = 0;
+        } else if (status?.details?.causes) {
+          const exitCause = status.details.causes.find(c => c.reason === 'ExitCode');
+          if (exitCause) exitCode = parseInt(exitCause.message, 10);
+        } else if (typeof status?.message === 'string') {
+          const m = status.message.match(/exit code (\d+)/);
+          if (m) exitCode = parseInt(m[1], 10);
+        }
+        if (exitCode === null) exitCode = status?.status === 'Success' ? 0 : 1;
+      },
+    ).then((conn) => {
+      ws = conn;
+      // Connection closed — resolve.
+      if (ws && typeof ws.on === 'function') {
+        ws.on('close', () => resolve());
+        ws.on('error', (err) => reject(err));
+      } else {
+        // If exec.exec resolves without a handle, just wait a tick for streams.
+        stdoutStream.on('end', () => resolve());
+      }
+    }).catch(reject);
+  });
+
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { ws?.close?.(); } catch { /* ignore */ }
+    try { stdoutStream.end(); } catch { /* ignore */ }
+    try { stderrStream.end(); } catch { /* ignore */ }
+  }, timeoutMs);
+
+  try {
+    await done;
+  } catch (err) {
+    if (!timedOut) throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  return {
+    stdout: Buffer.concat(stdoutChunks),
+    stderr: Buffer.concat(stderrChunks),
+    exitCode: timedOut ? null : exitCode,
+    timedOut,
+  };
+}
+
 export async function createNamespaceIdempotent(name, checkDbProject) {
   const status = await checkNamespaceStatus(name);
 
