@@ -114,11 +114,21 @@ export function NewProjectWizard({ onComplete, onCancel }) {
       if (allServices.length === 0) {
         setAnalyzing(false)
         setGenerating(true)
-        setGenerationStatus('Analyzing repository structure...')
+        setGenerationStatus('Spinning up validation sandbox...')
 
         try {
-          setGenerationStatus('Generating Dockerfile with AI...')
+          // Best-effort progress updates. The real work happens server-side;
+          // these advance on a timer so the spinner isn't stuck on one label.
+          const statusStages = [
+            { at: 3000, text: 'Cloning repo into sandbox...' },
+            { at: 10000, text: 'Analyzing repo layout...' },
+            { at: 20000, text: 'Building in sandbox to validate...' },
+            { at: 60000, text: 'Still validating (large repos can take a minute)...' },
+          ]
+          const timeouts = statusStages.map(s => setTimeout(() => setGenerationStatus(s.text), s.at))
+
           const generated = await generateDockerfile(repo.url, repo.defaultBranch)
+          timeouts.forEach(clearTimeout)
 
           if (generated.success) {
             setGeneratedInfo(generated)
@@ -143,11 +153,22 @@ export function NewProjectWizard({ onComplete, onCancel }) {
             setServices(allServices)
             setCurrentStep(STEPS.REVIEW)
           } else {
-            setError('Failed to generate Dockerfile. Please add one manually.')
+            setError({ message: 'Failed to generate Dockerfile. Please add one manually.' })
           }
         } catch (genErr) {
           console.error('Dockerfile generation failed:', genErr)
-          setError(`No Dockerfile found and generation failed: ${genErr.message}`)
+          // Validation failure from the sandbox agent — surface structured details.
+          if (genErr.status === 422) {
+            setError({
+              title: 'BUILD VALIDATION FAILED',
+              message: genErr.data?.message || genErr.message,
+              suggestedUserActions: genErr.data?.suggestedUserActions,
+              buildOutput: genErr.data?.buildOutput,
+              stage: genErr.data?.stage,
+            })
+          } else {
+            setError({ message: `Dockerfile generation failed: ${genErr.message}` })
+          }
         } finally {
           setGenerating(false)
           setGenerationStatus('')
@@ -392,7 +413,7 @@ export function NewProjectWizard({ onComplete, onCancel }) {
           </p>
           {generating && (
             <p className="font-mono text-xs text-terminal-secondary mt-2">
-              AI is detecting your project type and generating a Dockerfile
+              AI generates a Dockerfile and validates it builds successfully in a sandbox before we continue
             </p>
           )}
         </div>
@@ -519,10 +540,28 @@ export function NewProjectWizard({ onComplete, onCancel }) {
         className="mb-8"
       />
 
-      {/* Error Display */}
+      {/* Error Display — renders strings or structured validation errors */}
       {error && (
-        <TerminalCard variant="red" title="ERROR">
-          <p className="font-mono text-terminal-red">{error}</p>
+        <TerminalCard variant="red" title={(typeof error === 'object' && error.title) || 'ERROR'}>
+          {typeof error === 'string' ? (
+            <p className="font-mono text-terminal-red">{error}</p>
+          ) : (
+            <div className="space-y-3 font-mono text-sm">
+              <p className="text-terminal-red whitespace-pre-wrap">{error.message}</p>
+              {error.suggestedUserActions && (
+                <div>
+                  <div className="text-terminal-secondary mb-1">─── SUGGESTED FIX ───</div>
+                  <p className="text-terminal-primary whitespace-pre-wrap">{error.suggestedUserActions}</p>
+                </div>
+              )}
+              {error.buildOutput && (
+                <div>
+                  <div className="text-terminal-secondary mb-1">─── BUILD OUTPUT ───</div>
+                  <pre className="text-xs text-terminal-muted whitespace-pre-wrap overflow-x-auto max-h-64 overflow-y-auto">{error.buildOutput}</pre>
+                </div>
+              )}
+            </div>
+          )}
         </TerminalCard>
       )}
 

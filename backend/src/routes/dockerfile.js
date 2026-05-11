@@ -1,5 +1,9 @@
 import { decrypt } from '../services/encryption.js';
-import { generateForRepo, getGeneratedFile } from '../services/dockerfileGenerator.js';
+import {
+  generateForRepo,
+  getGeneratedFile,
+  DockerfileValidationError,
+} from '../services/dockerfileGenerator.js';
 import { isLLMAvailable, DEFAULT_MODEL } from '../services/llmClient.js';
 import logger from '../services/logger.js';
 
@@ -91,6 +95,24 @@ export default async function dockerfileRoutes(fastify, options) {
         tokensUsed: result.tokensUsed
       };
     } catch (error) {
+      // Validation failure — the agent tried to build the repo and failed. Surface
+      // it loudly with structured details so the UI can render the user-facing
+      // fix rather than dropping into a generic 500.
+      if (error instanceof DockerfileValidationError) {
+        logger.warn({
+          repoUrl,
+          reason: error.reason,
+          stage: error.stage,
+        }, 'Dockerfile validation failed');
+        return reply.code(422).send({
+          error: 'Validation Failed',
+          message: error.reason,
+          stage: error.stage,
+          suggestedUserActions: error.suggestedUserActions,
+          buildOutput: error.buildOutput,
+        });
+      }
+
       logger.error({ error: error.message, repoUrl }, 'Dockerfile generation failed');
 
       // Handle specific error types

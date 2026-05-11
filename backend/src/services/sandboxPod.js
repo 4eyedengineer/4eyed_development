@@ -13,6 +13,12 @@ import logger from './logger.js';
 const STDOUT_CAP = 50 * 1024;
 const STDERR_CAP = 50 * 1024;
 
+// Default sandbox image. Override via SANDBOX_IMAGE env var — point this at a
+// custom multi-runtime image (Harbor, GHCR, etc.) to skip runtime installs
+// during agent sessions. The default has node+npm+git+apt out of the box;
+// agents install other runtimes (python, go, ruby, etc.) on demand.
+const DEFAULT_SANDBOX_IMAGE = process.env.SANDBOX_IMAGE || 'node:20-bookworm';
+
 /**
  * Create an ephemeral sandbox Pod for an agent session. Blocks until the pod
  * reports Ready or the timeout elapses.
@@ -26,7 +32,7 @@ const STDERR_CAP = 50 * 1024;
 export async function createSandbox({
   namespace,
   sessionId,
-  imageTag = 'node:20-bookworm-slim',
+  imageTag = DEFAULT_SANDBOX_IMAGE,
 }) {
   if (!namespace) throw new Error('createSandbox: namespace required');
   if (!sessionId) throw new Error('createSandbox: sessionId required');
@@ -131,6 +137,85 @@ function capBuffer(buf, cap) {
  *
  * @returns {Promise<{stdout: string, stderr: string, exitCode: number|null, timedOut: boolean, durationMs: number}>}
  */
+/**
+ * Clone a GitHub repo directly inside the sandbox pod. Uses an embedded token
+ * for auth; the token appears in process args inside the pod only and is
+ * redacted from any stderr/stdout we log on the host.
+ *
+ * The repo is cloned into /workspace (which we first empty). Optionally checks
+ * out a specific commit SHA after cloning.
+ *
+ * @param {object} args
+ * @param {string} args.namespace
+ * @param {string} args.podName
+ * @param {string} args.repoUrl       - e.g. https://github.com/owner/repo
+ * @param {string} args.branch        - branch name
+ * @param {string} [args.commitSha]   - optional commit SHA to check out
+ * @param {string} args.githubToken   - OAuth token (x-access-token flow)
+ * @returns {Promise<{durationMs: number}>}
+ */
+export async function cloneRepoIntoSandbox({
+  namespace,
+  podName,
+  repoUrl,
+  branch,
+  commitSha,
+  githubToken,
+}) {
+  if (!namespace || !podName) throw new Error('cloneRepoIntoSandbox: namespace & podName required');
+  if (!repoUrl || !branch) throw new Error('cloneRepoIntoSandbox: repoUrl & branch required');
+  if (!githubToken) throw new Error('cloneRepoIntoSandbox: githubToken required');
+
+  // Normalize repoUrl to https form and strip any embedded creds.
+  const cleanUrl = repoUrl.replace(/^git@github\.com:/, 'https://github.com/')
+    .replace(/\.git$/, '')
+    .replace(/^https:\/\/[^@]+@/, 'https://');
+  const authedUrl = cleanUrl.replace(
+    /^https:\/\//,
+    `https://x-access-token:${githubToken}@`,
+  );
+
+  // Depth 1 clone on the branch, then (optionally) fetch + checkout the specific
+  // SHA. Shallow keeps the clone fast; SHA checkout requires fetching that
+  // specific object if it's not in the shallow history.
+  const script = [
+    'set -e',
+    'rm -rf /workspace/* /workspace/.[!.]* 2>/dev/null || true',
+    `git clone --depth 50 --branch ${JSON.stringify(branch)} ${JSON.stringify(authedUrl)} /workspace`,
+    commitSha
+      ? `cd /workspace && git fetch --depth 50 origin ${JSON.stringify(commitSha)} 2>/dev/null || true && git checkout ${JSON.stringify(commitSha)}`
+      : '',
+    // Strip the embedded token from git config so subsequent run_command calls
+    // can't exfiltrate it by running `git remote -v`.
+    `cd /workspace && git remote set-url origin ${JSON.stringify(cleanUrl)}`,
+  ].filter(Boolean).join('\n');
+
+  const started = Date.now();
+  const { stdout, stderr, exitCode, timedOut } = await execInPod(
+    namespace,
+    podName,
+    ['sh', '-c', script],
+    { timeoutMs: 180_000 },
+  );
+  const durationMs = Date.now() - started;
+
+  // Redact any accidental token leakage before logging.
+  const redact = (buf) => buf.toString('utf8').split(githubToken).join('[redacted]');
+
+  if (timedOut) {
+    throw new Error(`cloneRepoIntoSandbox timed out after 180s for ${podName}`);
+  }
+  if (exitCode !== 0) {
+    const out = redact(stdout).slice(0, 1000);
+    const err = redact(stderr).slice(0, 2000);
+    throw new Error(`git clone failed (exit=${exitCode}) stderr=${err} stdout=${out}`);
+  }
+
+  logger.info({ podName, namespace, repoUrl: cleanUrl, branch, commitSha, durationMs },
+    'Repo cloned into sandbox');
+  return { durationMs };
+}
+
 export async function execInSandbox({
   namespace,
   podName,

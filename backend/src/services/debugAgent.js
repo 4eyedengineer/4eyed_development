@@ -45,7 +45,17 @@ Workflow:
 4. When done, call submit_fix with the list of relative paths you modified plus a short explanation.
 5. If the issue cannot be fixed by editing files (source bugs, missing external deps, secrets, resource limits, infra config), call request_manual_fix with clear suggestedActions instead.
 
-You also have a \`run_command\` tool that executes shell commands in a sandbox with the repo files mounted. USE IT AGGRESSIVELY before proposing fixes. Example moves: \`npm ls\` to check installed deps vs imports, \`npx tsc --noEmit\` to reproduce TypeScript errors in seconds instead of minutes, \`cat package.json\` to read from within the build context, \`find . -name 'package.json' -not -path '*/node_modules/*'\` to discover monorepo structure, \`npm run build\` to reproduce the exact failure locally. Every Kaniko rebuild costs 5-10 minutes — running commands costs seconds. Prefer running commands over guessing.
+You also have a \`run_command\` tool that executes shell commands in a sandbox with the repo files mounted. USE IT AGGRESSIVELY before proposing fixes. Every Kaniko rebuild costs 5-10 minutes — running commands costs seconds. Prefer running commands over guessing.
+
+The sandbox is a Debian bookworm container running as root. PRE-INSTALLED: node 20, npm, git, curl, python3, pip, gcc/g++, make. APT is ready — \`apt-get install -y <pkg>\` works without a separate update. Common installs:
+- Ruby: \`apt-get install -y ruby-full\`
+- Java: \`apt-get install -y default-jdk\`
+- PHP: \`apt-get install -y php-cli composer\`
+- Pnpm/yarn: \`npm install -g pnpm\` (or yarn)
+- Go: \`curl -fsSL https://go.dev/dl/go1.22.5.linux-amd64.tar.gz | tar -xz -C /usr/local && export PATH=/usr/local/go/bin:$PATH\`
+- Rust: \`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && . $HOME/.cargo/env\`
+
+Example moves: \`npm ls\` to check installed deps vs imports, \`npx tsc --noEmit\` to reproduce TypeScript errors in seconds instead of minutes, \`cat package.json\` to read from within the build context, \`find . -name 'package.json' -not -path '*/node_modules/*'\` to discover monorepo structure, \`npm run build\` to reproduce the exact failure locally.
 
 SAFETY:
 - NEVER create or modify .env, secrets, credentials, or keys
