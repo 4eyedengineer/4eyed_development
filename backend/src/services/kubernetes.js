@@ -830,18 +830,28 @@ export async function execInPod(namespace, podName, command, opts = {}) {
   // Lazy-load to avoid pulling the dep at module-init for non-exec paths.
   const k8sClient = await import('@kubernetes/client-node');
   const kc = new k8sClient.KubeConfig();
-  try {
+
+  // loadFromCluster() sets up a tokenFile-based auth provider that lazily
+  // reads /var/run/secrets/... at request time — so it succeeds at config
+  // time even out-of-cluster, then ENOENTs when Exec actually fires. We have
+  // to detect explicitly which mode we're in and build the config to match.
+  const hasInClusterToken = fs.existsSync(TOKEN_PATH);
+  if (hasInClusterToken) {
     kc.loadFromCluster();
-    // If running out-of-cluster with a token env var, patch the context.
-    if (!kc.getCurrentCluster() && process.env.KUBERNETES_TOKEN) {
-      kc.loadFromOptions({
-        clusters: [{ name: 'default', server: K8S_API_SERVER, skipTLSVerify: !getCA() }],
-        users: [{ name: 'default', token: process.env.KUBERNETES_TOKEN }],
-        contexts: [{ name: 'default', cluster: 'default', user: 'default' }],
-        currentContext: 'default',
-      });
-    }
-  } catch {
+  } else if (process.env.KUBERNETES_TOKEN) {
+    const caPem = getCA();
+    kc.loadFromOptions({
+      clusters: [{
+        name: 'default',
+        server: K8S_API_SERVER,
+        skipTLSVerify: !caPem,
+        ...(caPem ? { caData: Buffer.from(caPem).toString('base64') } : {}),
+      }],
+      users: [{ name: 'default', token: process.env.KUBERNETES_TOKEN }],
+      contexts: [{ name: 'default', cluster: 'default', user: 'default' }],
+      currentContext: 'default',
+    });
+  } else {
     kc.loadFromDefault();
   }
 

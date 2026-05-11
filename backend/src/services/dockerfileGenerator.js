@@ -291,6 +291,21 @@ Then author the Dockerfile locally via write_file, run the build in the sandbox,
       tools,
       maxIterations: MAX_AGENT_ITERATIONS,
       maxTokens: MAX_AGENT_TOKENS,
+      onEvent: (event) => {
+        if (event.type === 'tool_use') {
+          // Truncate inputs to keep logs readable.
+          const summary = {};
+          if (event.name === 'run_command') summary.cmd = String(event.input?.command || '').slice(0, 160);
+          else if (event.name === 'write_file') summary.path = event.input?.path;
+          else if (event.name === 'str_replace') summary.path = event.input?.path;
+          else if (event.name === 'read_file') summary.path = event.input?.path;
+          else if (event.name === 'list_dir') summary.path = event.input?.path;
+          else if (event.name === 'search') summary.q = event.input?.query;
+          else if (event.name === 'submit_dockerfile') summary.detectedPort = event.input?.detectedPort;
+          else if (event.name === 'cannot_validate') summary.reason = String(event.input?.reason || '').slice(0, 120);
+          logger.info({ tool: event.name, iter: event.iteration, ...summary }, 'agent tool call');
+        }
+      },
     });
 
     const tokensUsed =
