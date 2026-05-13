@@ -15,6 +15,11 @@ const SANDBOX_NAMESPACE = process.env.SANDBOX_NAMESPACE || 'dangus-cloud';
 
 const MAX_AGENT_ITERATIONS = 30;
 const MAX_AGENT_TOKENS = 8000;
+// Hard wall-clock budget for the whole validation. Picked so a typical user
+// won't abandon: 5 min covers a `node:20-bookworm` cold pull + npm install +
+// a build for most repos. Slow/large monorepos that exceed this will be
+// told loudly to provide their own Dockerfile.
+const MAX_VALIDATION_DURATION_MS = 5 * 60 * 1000;
 
 // Regex that matches common build/compile commands. When we see `exit=0` on
 // one of these via run_command, we mark the build as validated. This is the
@@ -126,17 +131,26 @@ export async function generateForService(db, service, githubToken) {
 
 /**
  * Public: generate and validate a Dockerfile without persisting (pre-creation).
+ *
+ * @param {string} githubToken
+ * @param {string} repoUrl
+ * @param {string} branch
+ * @param {object} [opts]
+ * @param {string} [opts.workdir] - Optional subdir within the repo (monorepo case)
  */
-export async function generateForRepo(githubToken, repoUrl, branch) {
+export async function generateForRepo(githubToken, repoUrl, branch, opts = {}) {
   if (!isLLMAvailable()) {
     throw new Error('LLM generation not available: ANTHROPIC_API_KEY not configured');
   }
-  logger.info({ repoUrl, branch }, 'Starting validated Dockerfile generation for repo');
+  const workdir = sanitizeWorkdir(opts.workdir);
+  logger.info({ repoUrl, branch, workdir }, 'Starting validated Dockerfile generation for repo');
   const result = await runDockerfileAgent({
     githubToken,
     repoUrl,
     branch,
+    workdir,
     sessionId: `preflight-${crypto.randomBytes(3).toString('hex')}`,
+    onEvent: opts.onEvent,
   });
   return {
     dockerfile: result.dockerfile,
@@ -149,7 +163,22 @@ export async function generateForRepo(githubToken, repoUrl, branch) {
     },
     tokensUsed: result.tokensUsed,
     validatedBy: result.validatedBy,
+    workdir: workdir || null,
   };
+}
+
+/**
+ * Normalize a user-supplied workdir. Must be a relative subpath within the
+ * repo — no absolute paths, no traversal. Empty/falsy returns ''.
+ */
+function sanitizeWorkdir(workdir) {
+  if (!workdir || typeof workdir !== 'string') return '';
+  const trimmed = workdir.replace(/^\/+|\/+$/g, '');
+  if (!trimmed) return '';
+  if (trimmed.split('/').some(seg => seg === '..' || seg === '.')) {
+    throw new Error(`Invalid workdir: ${workdir}`);
+  }
+  return trimmed;
 }
 
 /**
@@ -170,7 +199,7 @@ export class DockerfileValidationError extends Error {
 /**
  * Core ReAct loop: spawn sandbox, clone, run agent, enforce validation gate.
  */
-async function runDockerfileAgent({ githubToken, repoUrl, branch, sessionId }) {
+async function runDockerfileAgent({ githubToken, repoUrl, branch, sessionId, workdir = '', onEvent }) {
   const localSandboxDir = await createSandboxDir('dockerfile');
   let sandboxPod = null;
 
@@ -278,9 +307,20 @@ async function runDockerfileAgent({ githubToken, repoUrl, branch, sessionId }) {
 
     const tools = [...fsTools, commandTool, submitTool, cannotValidateTool];
 
+    const workdirHint = workdir
+      ? `
+
+IMPORTANT: The user selected the subdir \`${workdir}\` to deploy. The Dockerfile you author should:
+- Set its build context as \`${workdir}\` semantically — but since the Dockerfile will live at the REPO ROOT and be built with the repo root as the Kaniko context, your COPY paths must be repo-relative (e.g. \`COPY ${workdir}/package*.json ./\`, \`COPY ${workdir} .\`).
+- WORKDIR inside the image should reflect that you've copied \`${workdir}\` to the working dir.
+- For monorepos with shared deps (workspaces), you may need to also COPY workspace siblings — inspect to confirm.
+- Run the build steps inside the sandbox at \`/workspace/${workdir}\` (e.g. \`cd /workspace/${workdir} && npm ci && npm run build\`).
+- The detectedPort and start command should be for the app in \`${workdir}\`, not for siblings.`
+      : '';
+
     const initialMessage = `Generate a validated Dockerfile + .dockerignore for ${repoUrl} (branch: ${branch}).
 
-The sandbox Pod is ready with the repo cloned at /workspace. Start by running \`ls /workspace && cat /workspace/package.json 2>/dev/null || true\` (or the equivalent for the stack you detect) via run_command to orient yourself. Look for monorepo markers.
+The sandbox Pod is ready with the repo cloned at /workspace. Start by running \`ls /workspace && cat /workspace/package.json 2>/dev/null || true\` (or the equivalent for the stack you detect) via run_command to orient yourself. Look for monorepo markers.${workdirHint}
 
 Then author the Dockerfile locally via write_file, run the build in the sandbox, iterate until it succeeds, and finally call submit_dockerfile. If the build fundamentally cannot succeed, call cannot_validate.`;
 
@@ -291,6 +331,7 @@ Then author the Dockerfile locally via write_file, run the build in the sandbox,
       tools,
       maxIterations: MAX_AGENT_ITERATIONS,
       maxTokens: MAX_AGENT_TOKENS,
+      maxDurationMs: MAX_VALIDATION_DURATION_MS,
       onEvent: (event) => {
         if (event.type === 'tool_use') {
           // Truncate inputs to keep logs readable.
@@ -304,6 +345,20 @@ Then author the Dockerfile locally via write_file, run the build in the sandbox,
           else if (event.name === 'submit_dockerfile') summary.detectedPort = event.input?.detectedPort;
           else if (event.name === 'cannot_validate') summary.reason = String(event.input?.reason || '').slice(0, 120);
           logger.info({ tool: event.name, iter: event.iteration, ...summary }, 'agent tool call');
+
+          // Forward a compact view to the caller's onEvent (for the async job
+          // streaming pipeline). We don't forward raw tool_result content
+          // since it can be huge — the agent's own response handles that.
+          if (onEvent) {
+            try {
+              onEvent({
+                type: 'tool_use',
+                iteration: event.iteration,
+                name: event.name,
+                ...summary,
+              });
+            } catch (e) { /* swallow */ }
+          }
         }
       },
     });
@@ -341,6 +396,21 @@ Then author the Dockerfile locally via write_file, run the build in the sandbox,
         buildOutput: cannotValidate.buildOutput,
         stage: 'agent-declined',
       });
+    }
+
+    if (agentResult.stopReason === 'time_limit') {
+      throw new DockerfileValidationError(
+        `Validation timed out after ${Math.round(MAX_VALIDATION_DURATION_MS / 1000)}s. ${
+          buildValidated
+            ? 'A build command did succeed but the agent never finalized the Dockerfile.'
+            : 'No build command succeeded in the time budget.'
+        }`,
+        {
+          suggestedUserActions:
+            'This repo\'s build is slow enough that auto-validation isn\'t practical. Commit your own Dockerfile to skip the validator entirely, or open an issue.',
+          stage: 'timeout',
+        },
+      );
     }
 
     // Hit iteration cap or unexpected stop — also a loud failure.

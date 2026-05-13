@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { TerminalCard, TerminalDivider } from '../components/TerminalCard'
 import { WizardStepIndicator, CompactStepIndicator } from '../components/WizardStepIndicator'
 import { RepoSelector } from '../components/RepoSelector'
@@ -10,7 +10,8 @@ import { useToast } from '../components/Toast'
 import { createProject } from '../api/projects'
 import { createServicesBatch, triggerDeploy } from '../api/services'
 import { analyzeRepo } from '../api/github'
-import { generateDockerfile } from '../api/dockerfile'
+import { generateDockerfileAsync, getDockerfileJob } from '../api/dockerfile'
+import { useWebSocket } from '../hooks/useWebSocket'
 
 const STEPS = {
   NAME: 0,
@@ -28,6 +29,7 @@ const STEP_LABELS = [
 
 export function NewProjectWizard({ onComplete, onCancel }) {
   const toast = useToast()
+  const { subscribe } = useWebSocket()
 
   // Wizard state
   const [currentStep, setCurrentStep] = useState(STEPS.NAME)
@@ -36,6 +38,17 @@ export function NewProjectWizard({ onComplete, onCancel }) {
   const [selectedRepo, setSelectedRepo] = useState(null)
   const [analysis, setAnalysis] = useState(null)
   const [services, setServices] = useState([])
+  // Set when the analyzed repo is a monorepo with multiple workspaces and no
+  // services were auto-discovered. The user picks one before we generate.
+  const [workspacePicker, setWorkspacePicker] = useState(null) // {repo, monorepo} | null
+  // Live tool-call log from the agent during validation.
+  const [agentToolCalls, setAgentToolCalls] = useState([])
+  // Active job's unsubscribe fn so we can tear down on unmount/cancel.
+  const jobUnsubRef = useRef(null)
+
+  useEffect(() => () => {
+    if (jobUnsubRef.current) jobUnsubRef.current()
+  }, [])
 
   // Loading/error states
   const [analyzing, setAnalyzing] = useState(false)
@@ -112,67 +125,15 @@ export function NewProjectWizard({ onComplete, onCancel }) {
 
       // If no services found, try to generate a Dockerfile with AI
       if (allServices.length === 0) {
-        setAnalyzing(false)
-        setGenerating(true)
-        setGenerationStatus('Spinning up validation sandbox...')
-
-        try {
-          // Best-effort progress updates. The real work happens server-side;
-          // these advance on a timer so the spinner isn't stuck on one label.
-          const statusStages = [
-            { at: 3000, text: 'Cloning repo into sandbox...' },
-            { at: 10000, text: 'Analyzing repo layout...' },
-            { at: 20000, text: 'Building in sandbox to validate...' },
-            { at: 60000, text: 'Still validating (large repos can take a minute)...' },
-          ]
-          const timeouts = statusStages.map(s => setTimeout(() => setGenerationStatus(s.text), s.at))
-
-          const generated = await generateDockerfile(repo.url, repo.defaultBranch)
-          timeouts.forEach(clearTimeout)
-
-          if (generated.success) {
-            setGeneratedInfo(generated)
-
-            // Create a service from the generated Dockerfile
-            allServices = [{
-              name: projectName || repo.name || 'app',
-              type: 'container',
-              image: null,
-              build: {
-                context: '.',
-                dockerfile: 'Dockerfile'
-              },
-              port: generated.detectedPort || 8080,
-              envVars: [],
-              hasStorage: false,
-              selected: true,
-              generated: true,
-              framework: generated.framework
-            }]
-
-            setServices(allServices)
-            setCurrentStep(STEPS.REVIEW)
-          } else {
-            setError({ message: 'Failed to generate Dockerfile. Please add one manually.' })
-          }
-        } catch (genErr) {
-          console.error('Dockerfile generation failed:', genErr)
-          // Validation failure from the sandbox agent — surface structured details.
-          if (genErr.status === 422) {
-            setError({
-              title: 'BUILD VALIDATION FAILED',
-              message: genErr.data?.message || genErr.message,
-              suggestedUserActions: genErr.data?.suggestedUserActions,
-              buildOutput: genErr.data?.buildOutput,
-              stage: genErr.data?.stage,
-            })
-          } else {
-            setError({ message: `Dockerfile generation failed: ${genErr.message}` })
-          }
-        } finally {
-          setGenerating(false)
-          setGenerationStatus('')
+        // Monorepo? Detour through workspace picker before generation.
+        const mr = result.monorepo
+        if (mr?.isMonorepo && Array.isArray(mr.workspaces) && mr.workspaces.length > 1) {
+          setAnalyzing(false)
+          setWorkspacePicker({ repo, monorepo: mr })
+          return
         }
+        setAnalyzing(false)
+        await runGeneration(repo, '')
         return
       }
 
@@ -183,6 +144,101 @@ export function NewProjectWizard({ onComplete, onCancel }) {
     } finally {
       setAnalyzing(false)
     }
+  }
+
+  // Run the validated Dockerfile generation for a specific workdir (or root).
+  // Async pattern: POST kicks off a backend job, we subscribe to a WS channel
+  // for live tool calls + final result. Falls back to polling if the WS
+  // misses the final event (e.g. browser-tab-asleep).
+  const runGeneration = async (repo, workdir) => {
+    setGenerating(true)
+    setAgentToolCalls([])
+    setGenerationStatus(
+      workdir
+        ? `Spinning up validation sandbox for ${workdir}...`
+        : 'Spinning up validation sandbox...'
+    )
+
+    let jobId
+    try {
+      const start = await generateDockerfileAsync(repo.url, repo.defaultBranch, workdir)
+      jobId = start.jobId
+    } catch (e) {
+      setGenerating(false)
+      setGenerationStatus('')
+      setError({ message: `Failed to start validation: ${e.message}` })
+      return
+    }
+
+    const onComplete = (resultPayload) => {
+      if (jobUnsubRef.current) { jobUnsubRef.current(); jobUnsubRef.current = null }
+      setGenerating(false)
+      setGenerationStatus('')
+      setGeneratedInfo(resultPayload)
+      const newService = {
+        name: projectName || repo.name || 'app',
+        type: 'container',
+        image: null,
+        build: { context: '.', dockerfile: 'Dockerfile' },
+        port: resultPayload.detectedPort || 8080,
+        envVars: [],
+        hasStorage: false,
+        selected: true,
+        generated: true,
+        framework: resultPayload.framework,
+        workdir: workdir || null,
+      }
+      setServices([newService])
+      setWorkspacePicker(null)
+      setCurrentStep(STEPS.REVIEW)
+    }
+
+    const onFail = (failPayload) => {
+      if (jobUnsubRef.current) { jobUnsubRef.current(); jobUnsubRef.current = null }
+      setGenerating(false)
+      setGenerationStatus('')
+      setError({
+        title: 'BUILD VALIDATION FAILED',
+        message: failPayload.message || 'Unknown failure',
+        suggestedUserActions: failPayload.suggestedUserActions,
+        buildOutput: failPayload.buildOutput,
+        stage: failPayload.stage,
+      })
+    }
+
+    // Subscribe to live events.
+    const channel = `dockerfile_gen:${jobId}`
+    const unsub = subscribe(channel, (event) => {
+      const e = event?.payload
+      if (!e) return
+      if (e.type === 'tool_use') {
+        setAgentToolCalls(prev => [...prev, e].slice(-50))
+        // Tighten the status line based on what the agent is doing.
+        if (e.name === 'run_command' && e.cmd) {
+          const cmd = String(e.cmd)
+          if (/npm\s+(ci|install)/.test(cmd)) setGenerationStatus('Installing dependencies in sandbox...')
+          else if (/(npm|yarn|pnpm)\s+(run\s+)?build|ng build|tsc|next build/.test(cmd)) setGenerationStatus('Running build in sandbox...')
+          else if (/^(ls|cat|find|grep)/.test(cmd)) setGenerationStatus('Inspecting repo layout...')
+        } else if (e.name === 'submit_dockerfile') setGenerationStatus('Validating Dockerfile...')
+      } else if (e.type === 'status') {
+        setGenerationStatus(e.status === 'running' ? 'Agent running...' : `Status: ${e.status}`)
+      } else if (e.type === 'succeeded') {
+        onComplete(e.result)
+      } else if (e.type === 'failed') {
+        onFail(e)
+      }
+    })
+    jobUnsubRef.current = unsub
+
+    // Fallback: poll the job every 10s in case we miss the terminal WS event.
+    const pollInterval = setInterval(async () => {
+      if (!jobUnsubRef.current) { clearInterval(pollInterval); return }
+      try {
+        const job = await getDockerfileJob(jobId)
+        if (job.status === 'succeeded') { clearInterval(pollInterval); onComplete(job.result) }
+        else if (job.status === 'failed') { clearInterval(pollInterval); onFail(job.result || {}) }
+      } catch { /* transient — try again */ }
+    }, 10000)
   }
 
   const handleCreateEmptyProject = async () => {
@@ -406,17 +462,72 @@ export function NewProjectWizard({ onComplete, onCancel }) {
   const renderRepoStep = () => (
     <div className="space-y-4">
       {analyzing || generating ? (
-        <div className="text-center py-12">
-          <TerminalSpinner className="text-2xl" />
-          <p className="font-mono text-terminal-muted mt-4">
-            {generating ? generationStatus : `Analyzing ${selectedRepo?.fullName}...`}
-          </p>
-          {generating && (
-            <p className="font-mono text-xs text-terminal-secondary mt-2">
-              AI generates a Dockerfile and validates it builds successfully in a sandbox before we continue
+        <div className="py-6">
+          <div className="text-center">
+            <TerminalSpinner className="text-2xl" />
+            <p className="font-mono text-terminal-muted mt-4">
+              {generating ? generationStatus : `Analyzing ${selectedRepo?.fullName}...`}
             </p>
+            {generating && (
+              <p className="font-mono text-xs text-terminal-secondary mt-2">
+                AI generates a Dockerfile and validates it builds successfully in a sandbox before we continue
+              </p>
+            )}
+          </div>
+          {generating && agentToolCalls.length > 0 && (
+            <div className="mt-6 max-w-2xl mx-auto">
+              <TerminalCard title="AGENT ACTIVITY" variant="cyan">
+                <div className="font-mono text-xs space-y-0.5 max-h-80 overflow-y-auto">
+                  {agentToolCalls.map((e, i) => (
+                    <div key={i} className="text-terminal-muted">
+                      <span className="text-terminal-secondary">[{String(e.iteration).padStart(2, '0')}]</span>{' '}
+                      <span className="text-terminal-primary">{e.name}</span>
+                      {e.cmd && <span className="text-terminal-muted"> {e.cmd}</span>}
+                      {e.path && <span className="text-terminal-muted"> {e.path}</span>}
+                      {e.q && <span className="text-terminal-muted"> "{e.q}"</span>}
+                      {e.reason && <span className="text-terminal-red"> {e.reason}</span>}
+                    </div>
+                  ))}
+                </div>
+              </TerminalCard>
+            </div>
           )}
         </div>
+      ) : workspacePicker ? (
+        <TerminalCard title={`MONOREPO DETECTED — ${(workspacePicker.monorepo.type || 'workspaces').toUpperCase()}`} variant="cyan">
+          <p className="font-mono text-sm text-terminal-muted mb-4">
+            {workspacePicker.repo.fullName} has multiple workspaces. Pick which one to deploy.
+          </p>
+          <div className="space-y-1 font-mono">
+            {workspacePicker.monorepo.workspaces.map(ws => (
+              <button
+                key={ws.path}
+                className="block w-full text-left px-3 py-2 text-terminal-primary hover:bg-terminal-bg-hover border border-transparent hover:border-terminal-secondary transition-colors"
+                onClick={() => runGeneration(workspacePicker.repo, ws.path)}
+              >
+                <span className="text-terminal-secondary mr-2">[</span>
+                {ws.path}
+                <span className="text-terminal-secondary ml-2">]</span>
+                <span className="text-terminal-muted text-xs ml-3">{ws.name}</span>
+              </button>
+            ))}
+          </div>
+          <TerminalDivider className="my-3" />
+          <button
+            className="block w-full text-left px-3 py-2 text-terminal-muted hover:text-terminal-primary hover:bg-terminal-bg-hover border border-transparent hover:border-terminal-secondary transition-colors font-mono text-sm"
+            onClick={() => runGeneration(workspacePicker.repo, '')}
+          >
+            <span className="text-terminal-secondary mr-2">[</span>
+            ./
+            <span className="text-terminal-secondary ml-2">]</span>
+            <span className="text-terminal-muted text-xs ml-3">build from repo root (advanced)</span>
+          </button>
+          <div className="mt-4">
+            <TerminalButton variant="secondary" onClick={() => { setWorkspacePicker(null); }}>
+              [ BACK ]
+            </TerminalButton>
+          </div>
+        </TerminalCard>
       ) : (
         <>
           <TerminalCard title="SELECT REPOSITORY" variant="cyan">

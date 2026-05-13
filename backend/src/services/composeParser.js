@@ -274,6 +274,78 @@ export function findDockerfiles(tree) {
 }
 
 /**
+ * Detect monorepo layout from the repo tree + optional root package.json.
+ *
+ * Returns { isMonorepo, type, workspaces } where workspaces is a list of
+ * deployable subdirs the user should pick from. Returns isMonorepo=false
+ * when there's exactly 0 or 1 sub-package.json (no ambiguity).
+ *
+ * @param {Array<{path: string}>} tree - Repo file tree
+ * @param {string|null} rootPackageJsonContent - Root package.json contents if available
+ * @returns {{isMonorepo: boolean, type: string|null, workspaces: Array<{path: string, name: string, hasPackageJson: boolean}>}}
+ */
+export function detectMonorepo(tree, rootPackageJsonContent) {
+  const paths = new Set(tree.map(f => f.path));
+
+  // Strong monorepo signals at the repo root.
+  const hasNx = paths.has('nx.json');
+  const hasTurbo = paths.has('turbo.json');
+  const hasPnpmWorkspace = paths.has('pnpm-workspace.yaml');
+  const hasLerna = paths.has('lerna.json');
+
+  let workspacesField = null;
+  if (rootPackageJsonContent) {
+    try {
+      const pkg = JSON.parse(rootPackageJsonContent);
+      if (Array.isArray(pkg.workspaces)) workspacesField = pkg.workspaces;
+      else if (pkg.workspaces && Array.isArray(pkg.workspaces.packages)) workspacesField = pkg.workspaces.packages;
+    } catch { /* ignore */ }
+  }
+
+  // Find all sub-package.json files (not at root, not in node_modules).
+  const subPackageJsons = tree
+    .map(f => f.path)
+    .filter(p => p.endsWith('/package.json') && !p.includes('/node_modules/'));
+
+  // If no strong signals AND only 0–1 sub-packages, it's not a monorepo.
+  const hasStrongSignal = hasNx || hasTurbo || hasPnpmWorkspace || hasLerna || (workspacesField && workspacesField.length > 0);
+  if (!hasStrongSignal && subPackageJsons.length <= 1) {
+    return { isMonorepo: false, type: null, workspaces: [] };
+  }
+
+  // Build the candidate workspace list — one entry per sub-package.json dir.
+  // Prefer common monorepo conventions (apps/*, packages/*, services/*) at
+  // the front of the list when ranking.
+  const workspaces = subPackageJsons.map(p => {
+    const dir = p.replace(/\/package\.json$/, '');
+    const segments = dir.split('/');
+    const name = segments[segments.length - 1];
+    return { path: dir, name, hasPackageJson: true };
+  });
+
+  // Stable sort: known top-level conventions first, then alpha.
+  const TOP_DIRS = ['apps', 'packages', 'services', 'workspaces', 'libs'];
+  workspaces.sort((a, b) => {
+    const aTop = TOP_DIRS.indexOf(a.path.split('/')[0]);
+    const bTop = TOP_DIRS.indexOf(b.path.split('/')[0]);
+    if (aTop !== bTop) {
+      if (aTop === -1) return 1;
+      if (bTop === -1) return -1;
+      return aTop - bTop;
+    }
+    return a.path.localeCompare(b.path);
+  });
+
+  let type = 'workspaces';
+  if (hasNx) type = 'nx';
+  else if (hasTurbo) type = 'turborepo';
+  else if (hasPnpmWorkspace) type = 'pnpm';
+  else if (hasLerna) type = 'lerna';
+
+  return { isMonorepo: true, type, workspaces };
+}
+
+/**
  * Infer default storage size based on service type
  * @param {string} type - Service type
  * @returns {number|null} - Suggested storage in GB or null

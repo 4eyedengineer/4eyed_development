@@ -6,7 +6,7 @@ import {
   getRepoInfo,
   listBranches
 } from '../services/github.js';
-import { parseDockerCompose, findDockerfiles } from '../services/composeParser.js';
+import { parseDockerCompose, findDockerfiles, detectMonorepo } from '../services/composeParser.js';
 
 /**
  * Helper to get decrypted GitHub token for the current user
@@ -184,6 +184,14 @@ export default async function githubRoutes(fastify, options) {
       // Get repo tree to find standalone Dockerfiles
       const tree = await getRepoTree(githubToken, repoUrl, targetBranch);
       result.standaloneDockerfiles = findDockerfiles(tree);
+
+      // Detect monorepo layout. Only fetch root package.json if signals warrant it.
+      let rootPkg = null;
+      try {
+        const f = await getFileContent(githubToken, repoUrl, 'package.json', targetBranch);
+        if (f?.content) rootPkg = f.content;
+      } catch { /* ignore */ }
+      result.monorepo = detectMonorepo(tree, rootPkg);
 
       // Filter out Dockerfiles that are already referenced in compose services
       if (result.composeServices.length > 0) {

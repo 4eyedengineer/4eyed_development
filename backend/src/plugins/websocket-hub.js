@@ -367,6 +367,13 @@ async function websocketHubPlugin(fastify, options) {
     });
   });
 
+  appEvents.on('dockerfile_gen', (event) => {
+    wsManager.broadcast(event.channel, {
+      timestamp: event.timestamp,
+      payload: event.payload
+    });
+  });
+
   // Expose WebSocket manager on fastify instance
   fastify.decorate('wsManager', wsManager);
   fastify.decorate('appEvents', appEvents);

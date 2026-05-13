@@ -4,6 +4,7 @@ import {
   getGeneratedFile,
   DockerfileValidationError,
 } from '../services/dockerfileGenerator.js';
+import { createJob, getJob } from '../services/dockerfileGenerationJobs.js';
 import { isLLMAvailable, DEFAULT_MODEL } from '../services/llmClient.js';
 import logger from '../services/logger.js';
 
@@ -47,13 +48,16 @@ export default async function dockerfileRoutes(fastify, options) {
         required: ['repoUrl'],
         properties: {
           repoUrl: { type: 'string' },
-          branch: { type: 'string', default: 'main' }
+          branch: { type: 'string', default: 'main' },
+          // Optional subdir inside the repo to deploy from (monorepo support).
+          // Empty/missing = build from repo root.
+          workdir: { type: 'string' }
         }
       }
     }
   }, async (request, reply) => {
     const userId = request.user.id;
-    const { repoUrl, branch } = request.body;
+    const { repoUrl, branch, workdir } = request.body;
 
     try {
       // Check if LLM is available
@@ -73,10 +77,10 @@ export default async function dockerfileRoutes(fastify, options) {
         });
       }
 
-      logger.info({ userId, repoUrl, branch }, 'Generating Dockerfile for repo');
+      logger.info({ userId, repoUrl, branch, workdir }, 'Generating Dockerfile for repo');
 
       // Generate Dockerfile
-      const result = await generateForRepo(githubToken, repoUrl, branch);
+      const result = await generateForRepo(githubToken, repoUrl, branch, { workdir });
 
       logger.info({
         userId,
@@ -136,6 +140,90 @@ export default async function dockerfileRoutes(fastify, options) {
         details: error.message
       });
     }
+  });
+
+  /**
+   * POST /dockerfile/generate-async
+   * Kick off a background validation job. Returns 202 + {jobId}.
+   * Client subscribes to WS channel `dockerfile_gen:<jobId>` for live
+   * tool calls + final result.
+   */
+  fastify.post('/dockerfile/generate-async', {
+    schema: {
+      body: {
+        type: 'object',
+        required: ['repoUrl'],
+        properties: {
+          repoUrl: { type: 'string' },
+          branch: { type: 'string', default: 'main' },
+          workdir: { type: 'string' },
+        }
+      }
+    }
+  }, async (request, reply) => {
+    const userId = request.user.id;
+    const { repoUrl, branch, workdir } = request.body;
+
+    if (!isLLMAvailable()) {
+      return reply.code(503).send({
+        error: 'Service Unavailable',
+        message: 'Dockerfile generation is not configured. ANTHROPIC_API_KEY is missing.'
+      });
+    }
+
+    // Confirm the user has a token before kicking off — saves a failure-mode round trip.
+    const githubToken = await getGitHubToken(fastify, userId);
+    if (!githubToken) {
+      return reply.code(400).send({
+        error: 'Bad Request',
+        message: 'GitHub token not configured'
+      });
+    }
+
+    try {
+      const job = await createJob(fastify.db, userId, { repoUrl, branch, workdir, githubToken });
+      return reply.code(202).send({
+        jobId: job.id,
+        channel: `dockerfile_gen:${job.id}`,
+        status: job.status,
+      });
+    } catch (err) {
+      logger.error({ err: err.message, userId, repoUrl }, 'Failed to create gen job');
+      return reply.code(500).send({
+        error: 'Internal Server Error',
+        message: 'Failed to start Dockerfile generation',
+      });
+    }
+  });
+
+  /**
+   * GET /dockerfile/jobs/:jobId
+   * Fallback for clients that miss WS events — returns the full job state
+   * including the tool_events log and result.
+   */
+  fastify.get('/dockerfile/jobs/:jobId', {
+    schema: {
+      params: {
+        type: 'object',
+        required: ['jobId'],
+        properties: { jobId: { type: 'string', format: 'uuid' } }
+      }
+    }
+  }, async (request, reply) => {
+    const job = await getJob(fastify.db, request.params.jobId, request.user.id);
+    if (!job) return reply.code(404).send({ error: 'Not Found', message: 'Job not found' });
+    return {
+      id: job.id,
+      status: job.status,
+      repoUrl: job.repo_url,
+      branch: job.branch,
+      workdir: job.workdir,
+      toolEvents: job.tool_events,
+      result: job.result,
+      createdAt: job.created_at,
+      updatedAt: job.updated_at,
+      completedAt: job.completed_at,
+    };
   });
 
   /**

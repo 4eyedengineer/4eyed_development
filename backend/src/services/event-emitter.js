@@ -121,6 +121,21 @@ class AppEventEmitter extends EventEmitter {
     this.emit('debug:status', event);
     this.emit(`debug:${sessionId}:status`, event);
   }
+
+  /**
+   * Emit a Dockerfile generation job event (tool call, status change, completion).
+   * @param {string} jobId
+   * @param {object} payload - { type: 'tool_use'|'tool_result'|'status'|'succeeded'|'failed', ... }
+   */
+  emitDockerfileGen(jobId, payload) {
+    const event = {
+      channel: `dockerfile_gen:${jobId}`,
+      timestamp: new Date().toISOString(),
+      payload
+    };
+    this.emit('dockerfile_gen', event);
+    this.emit(`dockerfile_gen:${jobId}`, event);
+  }
 }
 
 // Singleton instance

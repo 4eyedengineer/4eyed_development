@@ -42,6 +42,7 @@ export async function runAgent({
   tools,
   maxIterations = 20,
   maxTokens = 16000,
+  maxDurationMs,
   onEvent,
 }) {
   if (!model) throw new Error('runAgent: model is required');
@@ -81,8 +82,26 @@ export async function runAgent({
   let iterations = 0;
   let lastResponse = null;
   let budgetExceeded = false;
+  const startedAt = Date.now();
 
   while (iterations < maxIterations) {
+    // Wall-clock budget check between iterations. Note: this can't interrupt
+    // an in-flight LLM call or a long-running tool — those each have their
+    // own internal timeouts. So real wall time may exceed maxDurationMs by
+    // up to (longest tool timeout + longest LLM call). For our use, that
+    // means ~5–8 min in practice.
+    if (maxDurationMs && Date.now() - startedAt > maxDurationMs) {
+      logger.warn({ iterations, elapsedMs: Date.now() - startedAt, maxDurationMs },
+        'agentRunner: wall-clock timeout');
+      return {
+        finalMessage: lastResponse,
+        messages,
+        usage: totalUsage,
+        iterations,
+        stopReason: 'time_limit',
+        budgetExceeded: true,
+      };
+    }
     iterations += 1;
 
     let response;
