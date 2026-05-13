@@ -88,6 +88,15 @@ async function websocketHubPlugin(fastify, options) {
           return result.rows.length > 0;
         }
 
+        case 'dockerfile_gen': {
+          // Verify user owns the generation job.
+          const result = await db.query(
+            `SELECT 1 FROM dockerfile_generation_jobs WHERE id = $1 AND user_id = $2`,
+            [resourceId, userId]
+          );
+          return result.rows.length > 0;
+        }
+
         default:
           return false;
       }
