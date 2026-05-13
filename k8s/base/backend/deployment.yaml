@@ -29,6 +29,8 @@ spec:
               value: "postgres://dangus:dangus-password@postgres:5432/dangus_cloud"
             - name: RUN_MIGRATIONS
               value: "true"
+            - name: RECONCILE_AUTO_CLEANUP
+              value: "true"
             - name: FRONTEND_URL
               valueFrom:
                 secretKeyRef:

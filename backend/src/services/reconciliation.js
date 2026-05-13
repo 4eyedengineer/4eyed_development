@@ -231,9 +231,67 @@ export async function runStartupHealthCheck(db) {
       summary: health.summary
     });
 
+    // Opt-in auto-cleanup. When RECONCILE_AUTO_CLEANUP=true the discrepancies
+    // logged above get fixed instead of just reported. Only acts on
+    // namespaces labeled `app.kubernetes.io/managed-by=dangus-cloud` so
+    // user/system namespaces are never touched. Default off — explicit opt-in
+    // in production deployment env.
+    if (process.env.RECONCILE_AUTO_CLEANUP === 'true' && !health.healthy) {
+      logger.info('Auto-cleanup enabled — reconciling discrepancies');
+      const result = await reconcile(db, {
+        dryRun: false,
+        deleteOrphanedNamespaces: true,
+        deleteGhostProjects: true,
+      });
+      logger.info('Auto-cleanup finished', {
+        actions: result.actions.length,
+        errors: result.errors.length,
+      });
+    }
+
     return health;
   } catch (err) {
     logger.error('Startup health check failed', { error: err.message });
     return null;
   }
+}
+
+/**
+ * Start a periodic reconciliation loop. Runs once per RECONCILE_INTERVAL_MS
+ * (default 1h) and applies the same RECONCILE_AUTO_CLEANUP rules as startup.
+ * Returns a stop function the caller can use to cancel during shutdown.
+ */
+export function startPeriodicReconciliation(db) {
+  const intervalMs = parseInt(process.env.RECONCILE_INTERVAL_MS || '', 10) || 60 * 60 * 1000;
+  const autoClean = process.env.RECONCILE_AUTO_CLEANUP === 'true';
+
+  logger.info('Starting periodic reconciliation', { intervalMs, autoClean });
+
+  const timer = setInterval(async () => {
+    try {
+      const health = await getHealthStatus(db);
+      if (health.healthy) return;
+
+      logger.info('Periodic reconciliation: discrepancies detected', { summary: health.summary });
+
+      if (autoClean) {
+        const result = await reconcile(db, {
+          dryRun: false,
+          deleteOrphanedNamespaces: true,
+          deleteGhostProjects: true,
+        });
+        logger.info('Periodic reconciliation: cleanup applied', {
+          actions: result.actions.length,
+          errors: result.errors.length,
+        });
+      }
+    } catch (err) {
+      logger.error('Periodic reconciliation tick failed', { error: err.message });
+    }
+  }, intervalMs);
+
+  // Don't keep the event loop alive solely for this timer.
+  if (typeof timer.unref === 'function') timer.unref();
+
+  return () => clearInterval(timer);
 }

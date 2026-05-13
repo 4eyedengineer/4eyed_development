@@ -23,7 +23,7 @@ import debugRoutes from './routes/debug.js';
 import adminRoutes from './routes/admin.js';
 import healthRoutes from './routes/health.js';
 import { startMetricsCollection, stopMetricsCollection } from './services/metricsCollector.js';
-import { runStartupHealthCheck } from './services/reconciliation.js';
+import { runStartupHealthCheck, startPeriodicReconciliation } from './services/reconciliation.js';
 
 const fastify = Fastify({
   logger: true,
@@ -192,7 +192,9 @@ const start = async () => {
     startMetricsCollection();
     fastify.log.info('Metrics collection started');
 
-    // Run startup health check (non-blocking, logs discrepancies)
+    // Run startup health check (non-blocking, logs discrepancies). If
+    // RECONCILE_AUTO_CLEANUP=true it also cleans up. Periodic reconciliation
+    // continues that work hourly (interval via RECONCILE_INTERVAL_MS).
     setImmediate(async () => {
       try {
         await runStartupHealthCheck(fastify.db);
@@ -200,6 +202,7 @@ const start = async () => {
         fastify.log.error('Startup health check error', { error: err.message });
       }
     });
+    fastify._stopReconciliation = startPeriodicReconciliation(fastify.db);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
@@ -210,6 +213,7 @@ const start = async () => {
 const shutdown = async (signal) => {
   fastify.log.info(`Received ${signal}, shutting down gracefully...`);
   stopMetricsCollection();
+  if (typeof fastify._stopReconciliation === 'function') fastify._stopReconciliation();
   await fastify.close();
   process.exit(0);
 };
