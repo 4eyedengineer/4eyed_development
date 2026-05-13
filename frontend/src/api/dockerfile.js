@@ -9,21 +9,6 @@ export async function getGenerationStatus() {
 }
 
 /**
- * Generate a Dockerfile for a repository using LLM
- * @param {string} repoUrl - Repository URL
- * @param {string} branch - Branch name
- * @returns {Promise<{success: boolean, dockerfile: string, dockerignore: string, detectedPort: number, framework: object}>}
- */
-export async function generateDockerfile(repoUrl, branch, workdir) {
-  const body = { repoUrl, branch };
-  if (workdir) body.workdir = workdir;
-  return apiFetch('/dockerfile/generate', {
-    method: 'POST',
-    body: JSON.stringify(body)
-  });
-}
-
-/**
  * Kick off an async Dockerfile generation job. Returns { jobId, channel, status }.
  * Subscribe to the WS channel for live tool calls + final result, or poll
  * GET /dockerfile/jobs/:jobId as a fallback.

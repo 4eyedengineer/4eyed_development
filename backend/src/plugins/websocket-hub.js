@@ -97,6 +97,14 @@ async function websocketHubPlugin(fastify, options) {
           return result.rows.length > 0;
         }
 
+        case 'projects': {
+          // Global "projects changed" notification — every authed user is
+          // allowed to subscribe. The receiver always re-fetches via the
+          // API, which is per-user authorized, so leaking the ping itself
+          // is harmless.
+          return resourceId === 'update' && !!userId;
+        }
+
         default:
           return false;
       }
@@ -377,6 +385,13 @@ async function websocketHubPlugin(fastify, options) {
   });
 
   appEvents.on('dockerfile_gen', (event) => {
+    wsManager.broadcast(event.channel, {
+      timestamp: event.timestamp,
+      payload: event.payload
+    });
+  });
+
+  appEvents.on('projects', (event) => {
     wsManager.broadcast(event.channel, {
       timestamp: event.timestamp,
       payload: event.payload

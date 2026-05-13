@@ -1,10 +1,17 @@
-import { listManagedNamespaces, deleteNamespace, createNamespace } from './kubernetes.js';
+import { listManagedNamespaces, deleteNamespace, createNamespace, getPodsByLabel, deletePod } from './kubernetes.js';
 import logger from './logger.js';
 
 /**
  * Reconciliation service for maintaining consistency between
  * the database (source of truth) and Kubernetes cluster state.
  */
+
+// Sandbox pods are owned by the backend and live in its own namespace.
+// They have activeDeadlineSeconds=3600 inside the pod spec, but a pod that
+// terminates leaves a corpse behind, and a pod that survives a backend
+// crash mid-job becomes a leak. Reap anything older than this threshold.
+const SANDBOX_NAMESPACE = process.env.SANDBOX_NAMESPACE || 'dangus-cloud';
+const SANDBOX_POD_MAX_AGE_MS = 60 * 60 * 1000;
 
 /**
  * Get the current health status comparing DB projects vs K8s namespaces
@@ -145,6 +152,72 @@ export async function reconcile(db, options = {}) {
       }
 
       actions.push(action);
+    }
+  }
+
+  // Reap orphan sandbox pods (agent crashes / backend restarts leave these
+  // behind even though they have activeDeadlineSeconds=3600). We delete any
+  // sandbox pod older than the threshold, regardless of phase — terminated
+  // ones are corpses, Running ones from killed jobs are wasted compute.
+  if (deleteOrphanedNamespaces && SANDBOX_NAMESPACE) {
+    try {
+      const podsResult = await getPodsByLabel(SANDBOX_NAMESPACE, 'app=dangus-agent-sandbox');
+      const cutoffMs = Date.now() - SANDBOX_POD_MAX_AGE_MS;
+      const stalePods = (podsResult.items || []).filter(p => {
+        const created = p.metadata?.creationTimestamp;
+        if (!created) return false;
+        return new Date(created).getTime() < cutoffMs;
+      });
+      for (const pod of stalePods) {
+        const action = {
+          type: 'DELETE_STALE_SANDBOX_POD',
+          target: `${SANDBOX_NAMESPACE}/${pod.metadata.name}`,
+          status: dryRun ? 'dry_run' : 'pending'
+        };
+        if (!dryRun) {
+          try {
+            await deletePod(SANDBOX_NAMESPACE, pod.metadata.name, { gracePeriodSeconds: 0 });
+            action.status = 'success';
+            logger.info(`Reconciliation: Deleted stale sandbox pod ${pod.metadata.name}`);
+          } catch (err) {
+            if (err?.status !== 404) {
+              action.status = 'error';
+              action.error = err.message;
+              errors.push({ type: 'DELETE_STALE_SANDBOX_POD', target: pod.metadata.name, error: err.message });
+            } else {
+              action.status = 'success'; // already gone
+            }
+          }
+        }
+        actions.push(action);
+      }
+    } catch (err) {
+      logger.warn('Reconciliation: failed to list sandbox pods', { error: err.message });
+    }
+  }
+
+  // Purge old completed/failed Dockerfile-gen jobs. Keeps the table small
+  // and matches the "no PII retained" hygiene we want for tool-call logs.
+  if (deleteGhostProjects) {
+    try {
+      const purgeResult = await db.query(
+        `DELETE FROM dockerfile_generation_jobs
+         WHERE status IN ('succeeded', 'failed')
+           AND completed_at < NOW() - INTERVAL '7 days'
+         RETURNING id`
+      );
+      if (purgeResult.rowCount > 0) {
+        actions.push({
+          type: 'PURGE_OLD_GEN_JOBS',
+          target: `${purgeResult.rowCount} rows`,
+          status: dryRun ? 'dry_run' : 'success',
+        });
+        if (!dryRun) {
+          logger.info(`Reconciliation: Purged ${purgeResult.rowCount} old generation jobs`);
+        }
+      }
+    } catch (err) {
+      logger.warn('Reconciliation: failed to purge old gen jobs', { error: err.message });
     }
   }
 

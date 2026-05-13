@@ -123,6 +123,20 @@ class AppEventEmitter extends EventEmitter {
   }
 
   /**
+   * Emit a global "projects changed" ping. Subscribers (e.g. the sidebar
+   * quick-nav) re-fetch their per-user list via the API.
+   */
+  emitProjectsUpdate() {
+    const event = {
+      channel: 'projects:update',
+      timestamp: new Date().toISOString(),
+      payload: {},
+    };
+    this.emit('projects', event);
+    this.emit('projects:update', event);
+  }
+
+  /**
    * Emit a Dockerfile generation job event (tool call, status change, completion).
    * @param {string} jobId
    * @param {object} payload - { type: 'tool_use'|'tool_result'|'status'|'succeeded'|'failed', ... }

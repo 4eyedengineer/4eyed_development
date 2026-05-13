@@ -75,7 +75,9 @@ Your goal: produce a Dockerfile where the build steps DEMONSTRABLY succeed again
 5. Once a build command exits 0, call submit_dockerfile.
 
 ## Rules
-- NEVER modify files in /workspace (repo source is read-only to you). Only author the Dockerfile + .dockerignore locally.
+- NEVER modify files in /workspace (repo source is read-only to you). Only author the Dockerfile + .dockerignore locally via write_file/str_replace.
+- This includes via run_command: do NOT use shell redirects (\`>\`, \`>>\`), \`sed -i\`, \`cat <<EOF >\`, \`tee\`, or any other shell mechanism to write or edit files under /workspace. Read-only commands (\`cat\`, \`ls\`, \`find\`, \`grep\`, \`head\`, \`tail\`) and build commands that write only to ignored paths (\`/tmp\`, \`node_modules\`, \`dist\`, \`.next\`, \`target\`) are fine.
+- If the repo's source genuinely needs a fix to build, call cannot_validate and describe what the user should change. Do not silently patch their source.
 - Use specific version tags (never :latest). Prefer alpine/slim bases.
 - Multi-stage builds when beneficial (build stage → runtime stage).
 - Run as non-root. chown any writable dirs before switching USER.
@@ -83,51 +85,6 @@ Your goal: produce a Dockerfile where the build steps DEMONSTRABLY succeed again
 - Keep it minimal: the Dockerfile is a recipe of what you just proved works, not a kitchen sink.
 
 ## End your turn immediately after calling submit_dockerfile or cannot_validate.`;
-
-/**
- * Public: generate a validated Dockerfile for a service that doesn't have one.
- * Stores result in DB, mirrors the previous return shape.
- */
-export async function generateForService(db, service, githubToken) {
-  if (!isLLMAvailable()) {
-    throw new Error('LLM generation not available: ANTHROPIC_API_KEY not configured');
-  }
-
-  const { repo_url: repoUrl, branch } = service;
-  logger.info({ serviceId: service.id, repoUrl }, 'Starting validated Dockerfile generation');
-
-  const result = await runDockerfileAgent({
-    githubToken,
-    repoUrl,
-    branch,
-    sessionId: `svc-${service.id.slice(0, 12)}`,
-  });
-
-  await storeGeneratedFile(db, service.id, 'dockerfile', result.dockerfile, result);
-  await storeGeneratedFile(db, service.id, 'dockerignore', result.dockerignore, result);
-
-  logger.info({
-    serviceId: service.id,
-    language: result.language,
-    framework: result.framework,
-    port: result.detectedPort,
-    tokensUsed: result.tokensUsed,
-    validatedBy: result.validatedBy,
-  }, 'Validated Dockerfile stored');
-
-  return {
-    dockerfile: result.dockerfile,
-    dockerignore: result.dockerignore,
-    detectedPort: result.detectedPort,
-    framework: {
-      language: result.language,
-      framework: result.framework,
-      explanation: result.explanation,
-    },
-    tokensUsed: result.tokensUsed,
-    validatedBy: result.validatedBy,
-  };
-}
 
 /**
  * Public: generate and validate a Dockerfile without persisting (pre-creation).
@@ -444,22 +401,6 @@ async function cleanupSandbox(dir) {
   } catch (err) {
     logger.warn({ dir, err: err.message }, 'Failed to clean up sandbox dir');
   }
-}
-
-async function storeGeneratedFile(db, serviceId, fileType, content, metadata) {
-  const { language, framework, detectedPort, explanation, tokensUsed, validatedBy } = metadata;
-  const detectedFramework = { language, framework, port: detectedPort, explanation, validatedBy };
-  await db.query(`
-    INSERT INTO generated_files (service_id, file_type, content, llm_model, detected_framework, tokens_used)
-    VALUES ($1, $2, $3, $4, $5, $6)
-    ON CONFLICT (service_id, file_type)
-    DO UPDATE SET
-      content = EXCLUDED.content,
-      llm_model = EXCLUDED.llm_model,
-      detected_framework = EXCLUDED.detected_framework,
-      tokens_used = EXCLUDED.tokens_used,
-      updated_at = NOW()
-  `, [serviceId, fileType, content, DEFAULT_MODEL, JSON.stringify(detectedFramework), tokensUsed]);
 }
 
 export async function getGeneratedFile(db, serviceId, fileType) {

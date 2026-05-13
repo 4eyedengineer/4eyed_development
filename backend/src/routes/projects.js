@@ -1,4 +1,5 @@
 import { createNamespaceIdempotent, deleteNamespace, createSecret, scaleDeployment, listDeployments } from '../services/kubernetes.js';
+import appEvents from '../services/event-emitter.js';
 import { deleteRepositoriesByNamespace } from '../services/harbor.js';
 
 // Harbor registry config - loaded from environment for pushing built images
@@ -204,6 +205,7 @@ export default async function projectRoutes(fastify, options) {
       const project = result.rows[0];
 
       fastify.log.info(`Created project: ${projectName} (${project.id}) for user ${userId}`);
+      appEvents.emitProjectsUpdate();
 
       return reply.code(201).send({
         ...project,
@@ -364,6 +366,7 @@ export default async function projectRoutes(fastify, options) {
       await fastify.db.query('DELETE FROM projects WHERE id = $1', [projectId]);
 
       fastify.log.info(`Deleted project: ${project.name} (${projectId})`);
+      appEvents.emitProjectsUpdate();
 
       return { success: true, message: 'Project deleted successfully' };
     } catch (err) {

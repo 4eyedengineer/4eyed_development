@@ -1,9 +1,5 @@
 import { decrypt } from '../services/encryption.js';
-import {
-  generateForRepo,
-  getGeneratedFile,
-  DockerfileValidationError,
-} from '../services/dockerfileGenerator.js';
+import { getGeneratedFile } from '../services/dockerfileGenerator.js';
 import { createJob, getJob } from '../services/dockerfileGenerationJobs.js';
 import { isLLMAvailable, DEFAULT_MODEL } from '../services/llmClient.js';
 import logger from '../services/logger.js';
@@ -34,112 +30,6 @@ export default async function dockerfileRoutes(fastify, options) {
       available: isLLMAvailable(),
       model: DEFAULT_MODEL
     };
-  });
-
-  /**
-   * POST /dockerfile/generate
-   * Generate a Dockerfile for a repository using LLM
-   * This is used during project creation when no Dockerfile exists
-   */
-  fastify.post('/dockerfile/generate', {
-    schema: {
-      body: {
-        type: 'object',
-        required: ['repoUrl'],
-        properties: {
-          repoUrl: { type: 'string' },
-          branch: { type: 'string', default: 'main' },
-          // Optional subdir inside the repo to deploy from (monorepo support).
-          // Empty/missing = build from repo root.
-          workdir: { type: 'string' }
-        }
-      }
-    }
-  }, async (request, reply) => {
-    const userId = request.user.id;
-    const { repoUrl, branch, workdir } = request.body;
-
-    try {
-      // Check if LLM is available
-      if (!isLLMAvailable()) {
-        return reply.code(503).send({
-          error: 'Service Unavailable',
-          message: 'Dockerfile generation is not configured. ANTHROPIC_API_KEY is missing.'
-        });
-      }
-
-      // Get GitHub token
-      const githubToken = await getGitHubToken(fastify, userId);
-      if (!githubToken) {
-        return reply.code(400).send({
-          error: 'Bad Request',
-          message: 'GitHub token not configured'
-        });
-      }
-
-      logger.info({ userId, repoUrl, branch, workdir }, 'Generating Dockerfile for repo');
-
-      // Generate Dockerfile
-      const result = await generateForRepo(githubToken, repoUrl, branch, { workdir });
-
-      logger.info({
-        userId,
-        repoUrl,
-        language: result.framework.language,
-        framework: result.framework.framework,
-        port: result.detectedPort
-      }, 'Dockerfile generated successfully');
-
-      return {
-        success: true,
-        dockerfile: result.dockerfile,
-        dockerignore: result.dockerignore,
-        detectedPort: result.detectedPort,
-        framework: result.framework,
-        tokensUsed: result.tokensUsed
-      };
-    } catch (error) {
-      // Validation failure — the agent tried to build the repo and failed. Surface
-      // it loudly with structured details so the UI can render the user-facing
-      // fix rather than dropping into a generic 500.
-      if (error instanceof DockerfileValidationError) {
-        logger.warn({
-          repoUrl,
-          reason: error.reason,
-          stage: error.stage,
-        }, 'Dockerfile validation failed');
-        return reply.code(422).send({
-          error: 'Validation Failed',
-          message: error.reason,
-          stage: error.stage,
-          suggestedUserActions: error.suggestedUserActions,
-          buildOutput: error.buildOutput,
-        });
-      }
-
-      logger.error({ error: error.message, repoUrl }, 'Dockerfile generation failed');
-
-      // Handle specific error types
-      if (error.message.includes('not found')) {
-        return reply.code(404).send({
-          error: 'Not Found',
-          message: error.message
-        });
-      }
-
-      if (error.message.includes('rate limit')) {
-        return reply.code(429).send({
-          error: 'Too Many Requests',
-          message: 'LLM rate limit exceeded. Please try again later.'
-        });
-      }
-
-      return reply.code(500).send({
-        error: 'Internal Server Error',
-        message: 'Failed to generate Dockerfile',
-        details: error.message
-      });
-    }
   });
 
   /**
