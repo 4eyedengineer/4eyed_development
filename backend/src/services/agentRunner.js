@@ -44,6 +44,7 @@ export async function runAgent({
   maxTokens = 16000,
   maxDurationMs,
   onEvent,
+  signal,
 }) {
   if (!model) throw new Error('runAgent: model is required');
   if (!systemPrompt) throw new Error('runAgent: systemPrompt is required');
@@ -85,6 +86,20 @@ export async function runAgent({
   const startedAt = Date.now();
 
   while (iterations < maxIterations) {
+    // Caller-initiated cancel between iterations. The current LLM call /
+    // tool call can't be interrupted retroactively, but we won't start
+    // another one.
+    if (signal?.aborted) {
+      logger.info({ iterations }, 'agentRunner: cancelled via signal');
+      return {
+        finalMessage: lastResponse,
+        messages,
+        usage: totalUsage,
+        iterations,
+        stopReason: 'cancelled',
+        budgetExceeded: false,
+      };
+    }
     // Wall-clock budget check between iterations. Note: this can't interrupt
     // an in-flight LLM call or a long-running tool — those each have their
     // own internal timeouts. So real wall time may exceed maxDurationMs by
@@ -112,8 +127,20 @@ export async function runAgent({
         system: systemBlocks,
         tools: toolDefs.length > 0 ? toolDefs : undefined,
         messages,
-      });
+      }, signal ? { signal } : undefined);
     } catch (err) {
+      // AbortError (signal-triggered) is a normal cancel, not a real failure.
+      if (err?.name === 'AbortError' || signal?.aborted) {
+        logger.info({ iterations }, 'agentRunner: API call aborted by signal');
+        return {
+          finalMessage: lastResponse,
+          messages,
+          usage: totalUsage,
+          iterations,
+          stopReason: 'cancelled',
+          budgetExceeded: false,
+        };
+      }
       // Surface SDK typed errors verbatim so callers can branch on them.
       logger.error({ err: err.message, model, iteration: iterations }, 'agentRunner: API call failed');
       throw err;

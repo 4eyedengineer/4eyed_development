@@ -26,6 +26,10 @@ export async function getDockerfileJob(jobId) {
   return apiFetch(`/dockerfile/jobs/${jobId}`);
 }
 
+export async function cancelDockerfileJob(jobId) {
+  return apiFetch(`/dockerfile/jobs/${jobId}/cancel`, { method: 'POST' });
+}
+
 /**
  * Get the generated Dockerfile for a service
  * @param {string} serviceId - Service UUID

@@ -10,7 +10,7 @@ import { useToast } from '../components/Toast'
 import { createProject } from '../api/projects'
 import { createServicesBatch, triggerDeploy } from '../api/services'
 import { analyzeRepo } from '../api/github'
-import { generateDockerfileAsync, getDockerfileJob } from '../api/dockerfile'
+import { generateDockerfileAsync, getDockerfileJob, cancelDockerfileJob } from '../api/dockerfile'
 import { useWebSocket } from '../hooks/useWebSocket'
 
 const STEPS = {
@@ -45,6 +45,9 @@ export function NewProjectWizard({ onComplete, onCancel }) {
   const [agentToolCalls, setAgentToolCalls] = useState([])
   // Active job's unsubscribe fn so we can tear down on unmount/cancel.
   const jobUnsubRef = useRef(null)
+  // Active job ID + cancel-in-flight flag for the CANCEL button.
+  const [activeJobId, setActiveJobId] = useState(null)
+  const [cancelling, setCancelling] = useState(false)
 
   useEffect(() => () => {
     if (jobUnsubRef.current) jobUnsubRef.current()
@@ -163,6 +166,7 @@ export function NewProjectWizard({ onComplete, onCancel }) {
     try {
       const start = await generateDockerfileAsync(repo.url, repo.defaultBranch, workdir)
       jobId = start.jobId
+      setActiveJobId(jobId)
     } catch (e) {
       setGenerating(false)
       setGenerationStatus('')
@@ -174,6 +178,7 @@ export function NewProjectWizard({ onComplete, onCancel }) {
       if (jobUnsubRef.current) { jobUnsubRef.current(); jobUnsubRef.current = null }
       setGenerating(false)
       setGenerationStatus('')
+      setActiveJobId(null)
       setGeneratedInfo(resultPayload)
       const newService = {
         name: projectName || repo.name || 'app',
@@ -197,6 +202,8 @@ export function NewProjectWizard({ onComplete, onCancel }) {
       if (jobUnsubRef.current) { jobUnsubRef.current(); jobUnsubRef.current = null }
       setGenerating(false)
       setGenerationStatus('')
+      setActiveJobId(null)
+      setCancelling(false)
       setError({
         title: 'BUILD VALIDATION FAILED',
         message: failPayload.message || 'Unknown failure',
@@ -204,6 +211,20 @@ export function NewProjectWizard({ onComplete, onCancel }) {
         buildOutput: failPayload.buildOutput,
         stage: failPayload.stage,
       })
+    }
+
+    const onCancelled = () => {
+      if (jobUnsubRef.current) { jobUnsubRef.current(); jobUnsubRef.current = null }
+      setGenerating(false)
+      setGenerationStatus('')
+      setActiveJobId(null)
+      setCancelling(false)
+      // Don't show an error card — cancel is a deliberate action. Just
+      // drop the user back to the picker if they came from one, or the
+      // repo step otherwise.
+      if (workdir) {
+        setWorkspacePicker(prev => prev || { repo, monorepo: null })
+      }
     }
 
     // Subscribe to live events.
@@ -226,6 +247,8 @@ export function NewProjectWizard({ onComplete, onCancel }) {
         onComplete(e.result)
       } else if (e.type === 'failed') {
         onFail(e)
+      } else if (e.type === 'cancelled') {
+        onCancelled()
       }
     })
     jobUnsubRef.current = unsub
@@ -237,8 +260,29 @@ export function NewProjectWizard({ onComplete, onCancel }) {
         const job = await getDockerfileJob(jobId)
         if (job.status === 'succeeded') { clearInterval(pollInterval); onComplete(job.result) }
         else if (job.status === 'failed') { clearInterval(pollInterval); onFail(job.result || {}) }
+        else if (job.status === 'cancelled') { clearInterval(pollInterval); onCancelled() }
       } catch { /* transient — try again */ }
     }, 10000)
+  }
+
+  // User clicked CANCEL. Tells the backend to abort the agent loop; the WS
+  // 'cancelled' event (or fallback poll) drives the UI back to a clean state.
+  const handleCancelGeneration = async () => {
+    if (!activeJobId || cancelling) return
+    setCancelling(true)
+    setGenerationStatus('Cancelling...')
+    try {
+      await cancelDockerfileJob(activeJobId)
+    } catch (e) {
+      // Best-effort: even if the API call fails, the user has signalled
+      // intent. Tear down the local subscription and reset state.
+      console.warn('cancel API failed:', e)
+      if (jobUnsubRef.current) { jobUnsubRef.current(); jobUnsubRef.current = null }
+      setGenerating(false)
+      setGenerationStatus('')
+      setActiveJobId(null)
+      setCancelling(false)
+    }
   }
 
   const handleCreateEmptyProject = async () => {
@@ -474,21 +518,30 @@ export function NewProjectWizard({ onComplete, onCancel }) {
               </p>
             )}
           </div>
-          {generating && agentToolCalls.length > 0 && (
+          {generating && (
             <div className="mt-6 max-w-2xl mx-auto">
               <TerminalCard title="AGENT ACTIVITY" variant="cyan">
-                <div className="font-mono text-xs space-y-0.5 max-h-80 overflow-y-auto">
-                  {agentToolCalls.map((e, i) => (
-                    <div key={i} className="text-terminal-muted">
-                      <span className="text-terminal-secondary">[{String(e.iteration).padStart(2, '0')}]</span>{' '}
-                      <span className="text-terminal-primary">{e.name}</span>
-                      {e.cmd && <span className="text-terminal-muted"> {e.cmd}</span>}
-                      {e.path && <span className="text-terminal-muted"> {e.path}</span>}
-                      {e.q && <span className="text-terminal-muted"> "{e.q}"</span>}
-                      {e.reason && <span className="text-terminal-red"> {e.reason}</span>}
-                    </div>
-                  ))}
-                </div>
+                {agentToolCalls.length > 0 && (
+                  <div className="font-mono text-xs space-y-0.5 max-h-80 overflow-y-auto">
+                    {agentToolCalls.map((e, i) => (
+                      <div key={i} className="text-terminal-muted">
+                        <span className="text-terminal-secondary">[{String(e.iteration).padStart(2, '0')}]</span>{' '}
+                        <span className="text-terminal-primary">{e.name}</span>
+                        {e.cmd && <span className="text-terminal-muted"> {e.cmd}</span>}
+                        {e.path && <span className="text-terminal-muted"> {e.path}</span>}
+                        {e.q && <span className="text-terminal-muted"> "{e.q}"</span>}
+                        {e.reason && <span className="text-terminal-red"> {e.reason}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {activeJobId && (
+                  <div className="mt-3 pt-3 border-t border-terminal-secondary/30 flex justify-end">
+                    <TerminalButton variant="secondary" onClick={handleCancelGeneration} disabled={cancelling}>
+                      {cancelling ? '[ CANCELLING... ]' : '[ CANCEL ]'}
+                    </TerminalButton>
+                  </div>
+                )}
               </TerminalCard>
             </div>
           )}

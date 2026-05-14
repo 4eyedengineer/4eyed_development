@@ -1,6 +1,6 @@
 import { decrypt } from '../services/encryption.js';
 import { getGeneratedFile } from '../services/dockerfileGenerator.js';
-import { createJob, getJob } from '../services/dockerfileGenerationJobs.js';
+import { createJob, getJob, cancelJob } from '../services/dockerfileGenerationJobs.js';
 import { isLLMAvailable, DEFAULT_MODEL } from '../services/llmClient.js';
 import logger from '../services/logger.js';
 
@@ -114,6 +114,25 @@ export default async function dockerfileRoutes(fastify, options) {
       updatedAt: job.updated_at,
       completedAt: job.completed_at,
     };
+  });
+
+  /**
+   * POST /dockerfile/jobs/:jobId/cancel
+   * Cancel a running generation job. Aborts the agent loop, marks the row
+   * cancelled, emits a final WS event. Idempotent on already-terminal jobs.
+   */
+  fastify.post('/dockerfile/jobs/:jobId/cancel', {
+    schema: {
+      params: {
+        type: 'object',
+        required: ['jobId'],
+        properties: { jobId: { type: 'string', format: 'uuid' } }
+      }
+    }
+  }, async (request, reply) => {
+    const result = await cancelJob(fastify.db, request.params.jobId, request.user.id);
+    if (!result.found) return reply.code(404).send({ error: 'Not Found', message: 'Job not found' });
+    return { cancelled: !!result.cancelled, alreadyTerminal: !!result.alreadyTerminal };
   });
 
   /**

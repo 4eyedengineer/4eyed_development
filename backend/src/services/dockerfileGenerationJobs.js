@@ -1,7 +1,14 @@
-import { generateForRepo, DockerfileValidationError } from './dockerfileGenerator.js';
+import { generateForRepo, DockerfileValidationError, DockerfileCancelledError } from './dockerfileGenerator.js';
 import { decrypt } from './encryption.js';
 import appEvents from './event-emitter.js';
 import logger from './logger.js';
+
+// In-process registry of running jobs → AbortController. Lets cancelJob()
+// signal the runJob() coroutine. The map only contains jobs running on the
+// CURRENT backend pod — a backend restart drops the registry but also kills
+// the goroutine, so callers must handle "I asked to cancel a job from a
+// previous instance" gracefully (we still mark it cancelled in the DB).
+const activeJobs = new Map();
 
 /**
  * Create a new async Dockerfile generation job and kick off the agent in
@@ -45,6 +52,10 @@ export async function getJob(db, jobId, userId) {
  * status with structured detail.
  */
 async function runJob(db, job, githubToken) {
+  // Register a fresh AbortController so cancelJob() can signal us.
+  const controller = new AbortController();
+  activeJobs.set(job.id, controller);
+
   // Mark running.
   await db.query(`
     UPDATE dockerfile_generation_jobs
@@ -73,6 +84,7 @@ async function runJob(db, job, githubToken) {
   try {
     const result = await generateForRepo(githubToken, job.repo_url, job.branch, {
       workdir: job.workdir,
+      signal: controller.signal,
       onEvent: (event) => {
         // Persist + stream. Persistence is fire-and-forget — if a write fails
         // the user can still get the WS event.
@@ -96,6 +108,18 @@ async function runJob(db, job, githubToken) {
     appEvents.emitDockerfileGen(job.id, { type: 'succeeded', result });
     logger.info({ jobId: job.id }, 'Dockerfile gen job succeeded');
   } catch (err) {
+    if (err instanceof DockerfileCancelledError) {
+      // cancelJob() already updated the row + emitted the event, but mark
+      // here too in case cancel came from a SIGTERM or out-of-band path.
+      await db.query(`
+        UPDATE dockerfile_generation_jobs
+        SET status = 'cancelled', updated_at = NOW(), completed_at = NOW()
+        WHERE id = $1 AND status = 'running'
+      `, [job.id]);
+      appEvents.emitDockerfileGen(job.id, { type: 'cancelled' });
+      logger.info({ jobId: job.id }, 'Dockerfile gen job cancelled');
+      return;
+    }
     if (err instanceof DockerfileValidationError) {
       return failJob(db, job.id, {
         message: err.reason,
@@ -105,7 +129,41 @@ async function runJob(db, job, githubToken) {
       });
     }
     return failJob(db, job.id, { message: err.message, stage: 'crash' });
+  } finally {
+    activeJobs.delete(job.id);
   }
+}
+
+/**
+ * Cancel a running job. Aborts the agent's in-flight LLM call between
+ * iterations, marks the row 'cancelled', emits a final WS event. Idempotent —
+ * calling on an already-terminal job is a no-op.
+ */
+export async function cancelJob(db, jobId, userId) {
+  const result = await db.query(`
+    SELECT id, status FROM dockerfile_generation_jobs
+    WHERE id = $1 AND user_id = $2
+  `, [jobId, userId]);
+  if (result.rows.length === 0) return { found: false };
+  const { status } = result.rows[0];
+  if (['succeeded', 'failed', 'cancelled'].includes(status)) {
+    return { found: true, alreadyTerminal: true, status };
+  }
+
+  // Signal the in-process agent (if running on this pod).
+  const controller = activeJobs.get(jobId);
+  if (controller) controller.abort();
+
+  // Mark row + emit event. The runJob coroutine will also try to mark
+  // cancelled but the unique completed_at + status guard makes this safe.
+  await db.query(`
+    UPDATE dockerfile_generation_jobs
+    SET status = 'cancelled', updated_at = NOW(), completed_at = NOW()
+    WHERE id = $1 AND status IN ('pending', 'running')
+  `, [jobId]);
+  appEvents.emitDockerfileGen(jobId, { type: 'cancelled' });
+  logger.info({ jobId, userId, signalledLocally: !!controller }, 'Dockerfile gen job cancel requested');
+  return { found: true, cancelled: true };
 }
 
 async function failJob(db, jobId, failureDetail) {

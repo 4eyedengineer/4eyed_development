@@ -108,6 +108,7 @@ export async function generateForRepo(githubToken, repoUrl, branch, opts = {}) {
     workdir,
     sessionId: `preflight-${crypto.randomBytes(3).toString('hex')}`,
     onEvent: opts.onEvent,
+    signal: opts.signal,
   });
   return {
     dockerfile: result.dockerfile,
@@ -154,9 +155,20 @@ export class DockerfileValidationError extends Error {
 }
 
 /**
+ * Thrown when the agent loop was aborted via signal (user-initiated cancel).
+ * Callers should treat this as a clean stop, not a failure.
+ */
+export class DockerfileCancelledError extends Error {
+  constructor() {
+    super('Generation cancelled');
+    this.name = 'DockerfileCancelledError';
+  }
+}
+
+/**
  * Core ReAct loop: spawn sandbox, clone, run agent, enforce validation gate.
  */
-async function runDockerfileAgent({ githubToken, repoUrl, branch, sessionId, workdir = '', onEvent }) {
+async function runDockerfileAgent({ githubToken, repoUrl, branch, sessionId, workdir = '', onEvent, signal }) {
   const localSandboxDir = await createSandboxDir('dockerfile');
   let sandboxPod = null;
 
@@ -289,6 +301,7 @@ Then author the Dockerfile locally via write_file, run the build in the sandbox,
       maxIterations: MAX_AGENT_ITERATIONS,
       maxTokens: MAX_AGENT_TOKENS,
       maxDurationMs: MAX_VALIDATION_DURATION_MS,
+      signal,
       onEvent: (event) => {
         if (event.type === 'tool_use') {
           // Truncate inputs to keep logs readable.
@@ -333,6 +346,10 @@ Then author the Dockerfile locally via write_file, run the build in the sandbox,
       submitted: !!submitted,
       cannotValidate: !!cannotValidate,
     }, 'Dockerfile agent finished');
+
+    if (agentResult.stopReason === 'cancelled') {
+      throw new DockerfileCancelledError();
+    }
 
     if (submitted) {
       return {
