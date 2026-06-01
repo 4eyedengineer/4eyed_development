@@ -35,15 +35,23 @@ spec:
             limits:
               memory: "256Mi"
               cpu: "200m"
+          # vite dev server is slow to first-respond (on-demand compile on the
+          # first GET /), which blew the default 1s probe timeout and made
+          # liveness kill the pod before it warmed up. Generous timeouts +
+          # failureThreshold let it stabilise.
           readinessProbe:
             httpGet:
               path: /
               port: 5173
-            initialDelaySeconds: 5
+            initialDelaySeconds: 15
             periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /
               port: 5173
-            initialDelaySeconds: 10
+            initialDelaySeconds: 60
             periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6

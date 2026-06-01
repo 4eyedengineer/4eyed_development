@@ -7,7 +7,19 @@ metadata:
 spec:
   ingressClassName: traefik
   rules:
+    # .124 = r710's IP (retiring). .240 = MetalLB VIP, resolves natively to
+    # Traefik and survives r710 retirement. Both served during transition.
     - host: api.dangus.192.168.1.124.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 3001
+    - host: api.dangus.192.168.1.240.nip.io
       http:
         paths:
           - path: /
