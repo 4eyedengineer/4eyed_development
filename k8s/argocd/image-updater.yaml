@@ -13,6 +13,6 @@ spec:
     - namePattern: "dangus-cloud"
       images:
         - alias: backend
-          imageName: harbor.192.168.1.124.nip.io/dangus/dangus-backend:latest
+          imageName: harbor.192.168.1.240.nip.io/dangus/dangus-backend:latest
         - alias: frontend
-          imageName: harbor.192.168.1.124.nip.io/dangus/dangus-frontend:latest
+          imageName: harbor.192.168.1.240.nip.io/dangus/dangus-frontend:latest

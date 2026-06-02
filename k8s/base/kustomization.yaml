@@ -25,8 +25,8 @@ labels:
 
 images:
   - name: dangus-backend
-    newName: harbor.192.168.1.124.nip.io/dangus/dangus-backend
+    newName: harbor.192.168.1.240.nip.io/dangus/dangus-backend
     newTag: latest
   - name: dangus-frontend
-    newName: harbor.192.168.1.124.nip.io/dangus/dangus-frontend
+    newName: harbor.192.168.1.240.nip.io/dangus/dangus-frontend
     newTag: latest
